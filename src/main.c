@@ -1113,6 +1113,7 @@ int main(int argc, char *argv[])
 	int gdbus_flags = 0;
 
 	init_defaults();
+    __btd_toggle_debug();
 
 	context = g_option_context_new(NULL);
 	g_option_context_add_main_entries(context, options, NULL);
