@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -21,7 +21,6 @@
 #include <config.h>
 #endif
 
-#include <stdlib.h>
 #include <ell/ell.h>
 
 #include "mesh/crypto.h"
@@ -216,8 +215,14 @@ uint32_t net_key_decrypt(uint32_t iv_index, const uint8_t *pkt, size_t len,
 	if (iv_pkt != iv_flag)
 		iv_index--;
 
-	if (cache_len == len && memcmp(pkt, cache_pkt, len) == 0)
+	/* If we already successfully decrypted this packet, use cached data */
+	if (cache_id && cache_len == len && !memcmp(pkt, cache_pkt, len)) {
+		/* IV Index must match what was used to decrypt */
+		if (cache_iv_index != iv_index)
+			return 0;
+
 		goto done;
+	}
 
 	cache_id = 0;
 	memcpy(cache_pkt, pkt, len);
@@ -228,9 +233,6 @@ uint32_t net_key_decrypt(uint32_t iv_index, const uint8_t *pkt, size_t len,
 	l_queue_foreach(keys, decrypt_net_pkt, NULL);
 
 done:
-	if (cache_iv_index != iv_index)
-		return 0;
-
 	if (cache_id) {
 		*plain = cache_plain;
 		*plain_len = cache_plainlen;

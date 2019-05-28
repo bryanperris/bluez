@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -74,7 +74,10 @@
 
 #define VENDOR_ID_MASK		0xffff0000
 
+#define PRIMARY_NET_IDX		0x0000
 #define MAX_KEY_IDX		0x0fff
+#define MAX_MODEL_COUNT		0xff
+#define MAX_ELE_COUNT		0xff
 
 #define IS_UNASSIGNED(x)	((x) == UNASSIGNED_ADDRESS)
 #define IS_UNICAST(x)		(((x) > UNASSIGNED_ADDRESS) && \

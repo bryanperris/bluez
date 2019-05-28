@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -22,18 +22,13 @@
 #endif
 
 #define _GNU_SOURCE
-#include <stdlib.h>
-#include <stdio.h>
-#include <sys/time.h>
+
 #include <ell/ell.h>
-#include <json-c/json.h>
 
 #include "mesh/mesh-defs.h"
 #include "mesh/util.h"
-
 #include "mesh/crypto.h"
 #include "mesh/net-keys.h"
-#include "mesh/mesh.h"
 #include "mesh/node.h"
 #include "mesh/net.h"
 #include "mesh/mesh-io.h"
@@ -41,8 +36,6 @@
 #include "mesh/storage.h"
 #include "mesh/model.h"
 #include "mesh/appkey.h"
-#include "mesh/prov.h"
-#include "mesh/provision.h"
 
 #define abs_diff(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 
@@ -3120,6 +3113,7 @@ struct mesh_io *mesh_net_detach(struct mesh_net *net)
 	mesh_io_deregister_recv_cb(io, MESH_IO_FILTER_NET);
 
 	net->io = NULL;
+	l_queue_remove(nets, net);
 
 	return io;
 }

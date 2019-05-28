@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -39,6 +39,9 @@
 #include "mesh/dbus.h"
 #include "mesh/util.h"
 #include "mesh/model.h"
+
+/* Divide and round to ceiling (up) to calculate segment count */
+#define CEILDIV(val, div) (((val) + (div) - 1) / (div))
 
 struct mesh_model {
 	const struct mesh_model_ops *cbs;
@@ -451,7 +454,7 @@ static bool msg_send(struct mesh_node *node, bool credential, uint16_t src,
 
 	/* Use large MIC if it doesn't affect segmentation */
 	if (msg_len > 11 && msg_len <= 376) {
-		if ((out_len / 12) == ((out_len + 4) / 12)) {
+		if (CEILDIV(out_len, 12) == CEILDIV(out_len + 4, 12)) {
 			szmic = true;
 			out_len = msg_len + sizeof(uint64_t);
 		}

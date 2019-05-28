@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2017-2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2017-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -22,43 +22,49 @@
 #endif
 
 #define _GNU_SOURCE
-#include <errno.h>
+//#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <libgen.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <ftw.h>
 
 #include <json-c/json.h>
 #include <ell/ell.h>
 
 #include "mesh/mesh-defs.h"
-
-#include "mesh/mesh.h"
 #include "mesh/node.h"
-
 #include "mesh/net.h"
 #include "mesh/appkey.h"
-#include "mesh/model.h"
 #include "mesh/mesh-db.h"
+#include "mesh/util.h"
 #include "mesh/storage.h"
 
 struct write_info {
 	json_object *jnode;
-	const char *config_name;
+	const char *node_path;
 	void *user_data;
 	mesh_status_func_t cb;
 };
 
+static const char *cfg_name = "/node.json";
+static const char *bak_ext = ".bak";
+static const char *tmp_ext = ".tmp";
 static const char *storage_dir;
-static struct l_queue *node_ids;
 
-static bool simple_match(const void *a, const void *b)
+/* This is a thread-safe always malloced version of dirname which will work
+ * regardless of which underlying dirname() implementation is used.
+ */
+static char *alloc_dirname(const char *path)
 {
-	return a == b;
+	char *tmp = l_strdup(path);
+	char *dir;
+
+	dir = dirname(tmp);
+	strncpy(tmp, dir, strlen(path) + 1);
+
+	return tmp;
 }
 
 static bool read_node_cb(struct mesh_db_node *db_node, void *user_data)
@@ -171,7 +177,7 @@ static bool parse_node(struct mesh_node *node, json_object *jnode)
 	return true;
 }
 
-static bool parse_config(char *in_file, char *out_file, uint16_t node_id)
+static bool parse_config(char *in_file, char *out_dir, const uint8_t uuid[16])
 {
 	int fd;
 	char *str;
@@ -184,7 +190,7 @@ static bool parse_config(char *in_file, char *out_file, uint16_t node_id)
 	l_info("Loading configuration from %s", in_file);
 
 	fd = open(in_file, O_RDONLY);
-	if (!fd)
+	if (fd < 0)
 		return false;
 
 	if (fstat(fd, &st) == -1) {
@@ -208,7 +214,7 @@ static bool parse_config(char *in_file, char *out_file, uint16_t node_id)
 	if (!jnode)
 		goto done;
 
-	node = node_new();
+	node = node_new(uuid);
 
 	result = parse_node(node, jnode);
 
@@ -218,8 +224,7 @@ static bool parse_config(char *in_file, char *out_file, uint16_t node_id)
 	}
 
 	node_jconfig_set(node, jnode);
-	node_cfg_file_set(node, out_file);
-	node_id_set(node, node_id);
+	node_path_set(node, out_dir);
 
 done:
 	close(fd);
@@ -436,15 +441,12 @@ static bool save_config(json_object *jnode, const char *config_name)
 static void idle_save_config(void *user_data)
 {
 	struct write_info *info = user_data;
-	size_t len = strlen(info->config_name) + 5;
-	char *tmp = l_malloc(len);
-	char *bak = l_malloc(len);
+	char *tmp, *bak, *cfg;
 	bool result = false;
 
-	strncpy(tmp, info->config_name, len);
-	strncpy(bak, info->config_name, len);
-	tmp = strncat(tmp, ".tmp", 5);
-	bak = strncat(bak, ".bak", 5);
+	cfg = l_strdup_printf("%s%s", info->node_path, cfg_name);
+	tmp = l_strdup_printf("%s%s", cfg, tmp_ext);
+	bak = l_strdup_printf("%s%s", cfg, bak_ext);
 	remove(tmp);
 
 	l_debug("Storage-Wrote");
@@ -452,13 +454,14 @@ static void idle_save_config(void *user_data)
 
 	if (result) {
 		remove(bak);
-		rename(info->config_name, bak);
-		rename(tmp, info->config_name);
+		rename(cfg, bak);
+		rename(tmp, cfg);
 	}
 
 	remove(tmp);
 	l_free(tmp);
 	l_free(bak);
+	l_free(cfg);
 
 	if (info->cb)
 		info->cb(info->user_data, result);
@@ -473,7 +476,7 @@ void storage_save_config(struct mesh_node *node, bool no_wait,
 
 	info = l_new(struct write_info, 1);
 	info->jnode = node_jconfig_get(node);
-	info->config_name = node_cfg_file_get(node);
+	info->node_path = node_path_get(node);
 	info->cb = cb;
 	info->user_data = user_data;
 
@@ -523,6 +526,7 @@ bool storage_load_nodes(const char *dir_name)
 {
 	DIR *dir;
 	struct dirent *entry;
+	size_t path_len = strlen(dir_name) + strlen(cfg_name) + strlen(bak_ext);
 
 	create_dir(dir_name);
 	dir = opendir(dir_name);
@@ -533,44 +537,39 @@ bool storage_load_nodes(const char *dir_name)
 	}
 
 	storage_dir = dir_name;
-	node_ids = l_queue_new();
 
 	while ((entry = readdir(dir)) != NULL) {
-		char name_buf[PATH_MAX];
-		char *filename;
-		uint32_t node_id;
-		size_t len;
+		char *dir, *cfg, *bak;
+		uint8_t uuid[16];
+		size_t node_len;
 
 		if (entry->d_type != DT_DIR)
 			continue;
 
-		if (sscanf(entry->d_name, "%04x", &node_id) != 1)
+		/* Check path length */
+		node_len = strlen(entry->d_name);
+		if (path_len + node_len + 1 >= PATH_MAX)
 			continue;
 
-		snprintf(name_buf, PATH_MAX, "%s/%s/node.json", dir_name,
-								entry->d_name);
-
-		l_queue_push_tail(node_ids, L_UINT_TO_PTR(node_id));
-
-		len = strlen(name_buf);
-		filename = l_malloc(len + 1);
-
-		strncpy(filename, name_buf, len + 1);
-
-		if (parse_config(name_buf, filename, node_id))
+		if (!str2hex(entry->d_name, node_len, uuid, sizeof(uuid)))
 			continue;
 
-		/* Fall-back to Backup version */
-		snprintf(name_buf, PATH_MAX, "%s/%s/node.json.bak", dir_name,
-								entry->d_name);
+		dir = l_strdup_printf("%s/%s", dir_name, entry->d_name);
+		cfg = l_strdup_printf("%s%s", dir, cfg_name);
 
-		if (parse_config(name_buf, filename, node_id)) {
-			remove(filename);
-			rename(name_buf, filename);
-			continue;
+		if (!parse_config(cfg, dir, uuid)) {
+
+			/* Fall-back to Backup version */
+			bak = l_strdup_printf("%s%s", cfg, bak_ext);
+
+			if (parse_config(bak, dir, uuid)) {
+				remove(cfg);
+				rename(bak, cfg);
+			}
+			l_free(bak);
 		}
-
-		l_free(filename);
+		l_free(cfg);
+		l_free(dir);
 	}
 
 	return true;
@@ -579,12 +578,10 @@ bool storage_load_nodes(const char *dir_name)
 bool storage_create_node_config(struct mesh_node *node, void *data)
 {
 	struct mesh_db_node *db_node = data;
-	uint16_t node_id;
-	uint8_t num_tries = 0;
+	char uuid[33];
 	char name_buf[PATH_MAX];
-	char *filename;
 	json_object *jnode;
-	size_t len;
+	size_t max_len = strlen(cfg_name) + strlen(bak_ext);
 
 	if (!storage_dir)
 		return false;
@@ -594,39 +591,27 @@ bool storage_create_node_config(struct mesh_node *node, void *data)
 	if (!mesh_db_add_node(jnode, db_node))
 		return false;
 
-	do {
-		l_getrandom(&node_id, 2);
-		if (node_id && !l_queue_find(node_ids, simple_match,
-						L_UINT_TO_PTR(node_id)))
-			break;
-	} while (++num_tries < 10);
+	if (!hex2str(node_uuid_get(node), 16, uuid, sizeof(uuid)))
+		goto fail;
 
-	if (num_tries == 10)
-		l_error("Failed to generate unique node ID");
+	snprintf(name_buf, PATH_MAX, "%s/%s", storage_dir, uuid);
 
-	node_id_set(node, node_id);
-
-	snprintf(name_buf, PATH_MAX, "%s/%04x", storage_dir, node_id);
+	if (strlen(name_buf) + max_len >= PATH_MAX)
+		goto fail;
 
 	/* Create a new directory and node.json file */
 	if (mkdir(name_buf, 0755) != 0)
 		goto fail;
 
-	len = strlen(name_buf) + strlen("/node.json") + 1;
-	filename = l_malloc(len);
+	node_path_set(node, name_buf);
 
-	snprintf(filename, len, "%s/node.json", name_buf);
-	l_debug("New node config %s", filename);
+	snprintf(name_buf, PATH_MAX, "%s/%s%s", storage_dir, uuid, cfg_name);
+	l_debug("New node config %s", name_buf);
 
-	if (!save_config(jnode, filename)) {
-		l_free(filename);
+	if (!save_config(jnode, name_buf))
 		goto fail;
-	}
 
 	node_jconfig_set(node, jnode);
-	node_cfg_file_set(node, filename);
-
-	l_queue_push_tail(node_ids, L_UINT_TO_PTR(node_id));
 
 	return true;
 fail:
@@ -634,15 +619,29 @@ fail:
 	return false;
 }
 
+static int del_fobject(const char *fpath, const struct stat *sb, int typeflag,
+						struct FTW *ftwbuf)
+{
+	switch (typeflag) {
+	case FTW_DP:
+		rmdir(fpath);
+		l_debug("RMDIR %s", fpath);
+		break;
+
+	case FTW_SL:
+	default:
+		remove(fpath);
+		l_debug("RM %s", fpath);
+		break;
+	}
+	return 0;
+}
+
 /* Permanently remove node configuration */
 void storage_remove_node_config(struct mesh_node *node)
 {
-	char *cfgname;
+	char *node_path, *mesh_path, *mesh_name;
 	struct json_object *jnode;
-	const char *dir_name;
-	uint16_t node_id;
-	size_t len;
-	char *bak;
 
 	if (!node)
 		return;
@@ -653,31 +652,17 @@ void storage_remove_node_config(struct mesh_node *node)
 		json_object_put(jnode);
 	node_jconfig_set(node, NULL);
 
-	/* Delete node configuration file */
-	cfgname = (char *) node_cfg_file_get(node);
-	if (!cfgname)
-		return;
+	node_path = node_path_get(node);
+	l_debug("Delete node config %s", node_path);
 
-	l_debug("Delete node config file %s", cfgname);
-	remove(cfgname);
+	/* Make sure path name of node follows expected guidelines */
+	mesh_path = alloc_dirname(node_path);
+	mesh_name = basename(mesh_path);
+	if (strcmp(mesh_name, "mesh"))
+		goto done;
 
-	/* Delete the backup file */
-	len = strlen(cfgname) + 5;
-	bak = l_malloc(len);
-	strncpy(bak, cfgname, len);
-	bak = strncat(bak, ".bak", 5);
-	remove(bak);
-	l_free(bak);
+	nftw(node_path, del_fobject, 5, FTW_DEPTH | FTW_PHYS);
 
-	/* Delete the node directory */
-	dir_name = dirname(cfgname);
-
-	l_debug("Delete directory %s", dir_name);
-	rmdir(dir_name);
-
-	l_free(cfgname);
-	node_cfg_file_set(node, NULL);
-
-	node_id = node_id_get(node);
-	l_queue_remove(node_ids, L_UINT_TO_PTR(node_id));
+done:
+	l_free(mesh_path);
 }

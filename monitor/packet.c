@@ -9613,6 +9613,74 @@ static void le_ext_adv_report_evt(const void *data, uint8_t size)
 	}
 }
 
+static void le_per_adv_sync(const void *data, uint8_t size)
+{
+	const struct bt_hci_evt_le_per_sync_established *evt = data;
+
+	print_status(evt->status);
+	print_field("Sync handle: %d", evt->handle);
+	if (evt->sid > 0x0f)
+		print_field("Advertising SID: Reserved (0x%2.2x)", evt->sid);
+	else
+		print_field("Advertising SID: 0x%2.2x", evt->sid);
+
+	print_peer_addr_type("Advertiser address type", evt->addr_type);
+	print_addr("Advertiser address", evt->addr, evt->addr_type);
+	print_le_phy("Advertiser PHY", evt->phy);
+	print_slot_125("Periodic advertising invteral", evt->interval);
+	print_field("Advertiser clock accuracy: 0x%2.2x", evt->clock_accuracy);
+}
+
+static void le_per_adv_report_evt(const void *data, uint8_t size)
+{
+	const struct bt_hci_le_per_adv_report *evt = data;
+	const char *color_on;
+	const char *str;
+
+	print_field("Sync handle: %d", evt->handle);
+	print_power_level(evt->tx_power, NULL);
+	if (evt->rssi == 127)
+		print_field("RSSI: not available (0x%2.2x)",
+						(uint8_t) evt->rssi);
+	else if (evt->rssi >= -127 && evt->rssi <= 20)
+		print_field("RSSI: %d dBm (0x%2.2x)",
+				evt->rssi, (uint8_t) evt->rssi);
+	else
+		print_field("RSSI: reserved (0x%2.2x)",
+						(uint8_t) evt->rssi);
+	print_field("Unused: (0x%2.2x)", evt->unused);
+
+	switch (evt->data_status) {
+	case 0x00:
+		str = "Complete";
+		color_on = COLOR_GREEN;
+		break;
+	case 0x01:
+		str = "Incomplete, more data to come";
+		color_on = COLOR_YELLOW;
+		break;
+	case 0x02:
+		str = "Incomplete, data truncated, no more to come";
+		color_on = COLOR_RED;
+		break;
+	default:
+		str = "Reserved";
+		color_on = COLOR_RED;
+		break;
+	}
+
+	print_field("Data status: %s%s%s", color_on, str, COLOR_OFF);
+	print_field("Data length: 0x%2.2x", evt->data_len);
+	packet_hexdump(evt->data, evt->data_len);
+}
+
+static void le_per_adv_sync_lost(const void *data, uint8_t size)
+{
+	const struct bt_hci_evt_le_per_sync_lost *evt = data;
+
+	print_field("Sync handle: %d", evt->handle);
+}
+
 static void le_adv_set_term_evt(const void *data, uint8_t size)
 {
 	const struct bt_hci_evt_le_adv_set_term *evt = data;
@@ -9726,9 +9794,12 @@ static const struct subevent_data le_meta_event_table[] = {
 				le_phy_update_complete_evt, 5, true},
 	{ 0x0d, "LE Extended Advertising Report",
 				le_ext_adv_report_evt, 1, false},
-	{ 0x0e, "LE Periodic Advertising Sync Established" },
-	{ 0x0f, "LE Periodic Advertising Report" },
-	{ 0x10, "LE Periodic Advertising Sync Lost" },
+	{ 0x0e, "LE Periodic Advertising Sync Established",
+				le_per_adv_sync, 15, true },
+	{ 0x0f, "LE Periodic Advertising Report",
+				le_per_adv_report_evt, 7, false},
+	{ 0x10, "LE Periodic Advertising Sync Lost",
+				le_per_adv_sync_lost, 2, true},
 	{ 0x11, "LE Scan Timeout" },
 	{ 0x12, "LE Advertising Set Terminated",
 				le_adv_set_term_evt, 5, true},

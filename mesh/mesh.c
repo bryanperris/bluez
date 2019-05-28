@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -23,7 +23,6 @@
 
 #define _GNU_SOURCE
 #include <ell/ell.h>
-#include <json-c/json.h>
 
 #include "lib/bluetooth.h"
 #include "lib/mgmt.h"
@@ -38,8 +37,8 @@
 #include "mesh/model.h"
 #include "mesh/dbus.h"
 #include "mesh/error.h"
-#include "mesh/mesh.h"
 #include "mesh/agent.h"
+#include "mesh/mesh.h"
 
 /*
  * The default values for mesh configuration. Can be
@@ -76,12 +75,6 @@ struct join_data{
 	uint8_t *uuid;
 };
 
-struct attach_data {
-	uint64_t token;
-	struct l_dbus_message *msg;
-	const char *app;
-};
-
 static struct bt_mesh mesh;
 static struct l_queue *controllers;
 static struct mgmt *mgmt_mesh;
@@ -90,8 +83,8 @@ static bool initialized;
 /* We allow only one outstanding Join request */
 static struct join_data *join_pending;
 
-/* Pending Attach requests */
-static struct l_queue *attach_queue;
+/* Pending method requests */
+static struct l_queue *pending_queue;
 
 static bool simple_match(const void *a, const void *b)
 {
@@ -118,7 +111,7 @@ static void start_io(uint16_t index)
 
 	l_debug("Started mesh (io %p) on hci %u", mesh.io, index);
 
-	node_attach_io(io);
+	node_attach_io_all(io);
 }
 
 /* Used for any outbound traffic that doesn't have Friendship Constraints */
@@ -341,14 +334,13 @@ bool mesh_init(uint16_t index, const char *config_dir)
 	return true;
 }
 
-static void attach_exit(void *data)
+static void pending_request_exit(void *data)
 {
 	struct l_dbus_message *reply;
-	struct attach_data *pending = data;
+	struct l_dbus_message *msg = data;
 
-	reply = dbus_error(pending->msg, MESH_ERROR_FAILED, "Failed. Exiting");
+	reply = dbus_error(msg, MESH_ERROR_FAILED, "Failed. Exiting");
 	l_dbus_send(dbus_get_bus(), reply);
-	l_free(pending);
 }
 
 static void free_pending_join_call(bool failed)
@@ -388,7 +380,7 @@ void mesh_cleanup(void)
 		free_pending_join_call(true);
 	}
 
-	l_queue_destroy(attach_queue, attach_exit);
+	l_queue_destroy(pending_queue, pending_request_exit);
 	node_cleanup_all();
 	mesh_model_cleanup();
 
@@ -498,7 +490,7 @@ static bool prov_complete_cb(void *user_data, uint8_t status,
 	path = join_pending->app_path;
 
 	if (status == PROV_ERR_SUCCESS &&
-	    !node_add_pending_local(join_pending->node, info, mesh.io))
+	    !node_add_pending_local(join_pending->node, info))
 		status = PROV_ERR_UNEXPECTED_ERR;
 
 	if (status != PROV_ERR_SUCCESS) {
@@ -506,6 +498,7 @@ static bool prov_complete_cb(void *user_data, uint8_t status,
 		return false;
 	}
 
+	node_attach_io(join_pending->node, mesh.io);
 	token = node_get_token(join_pending->node);
 
 	msg = l_dbus_message_new_method_call(dbus, owner, path,
@@ -584,6 +577,13 @@ static struct l_dbus_message *join_network_call(struct l_dbus *dbus,
 							"Bad device UUID");
 	}
 
+	if (node_find_by_uuid(join_pending->uuid)) {
+		l_free(join_pending);
+		join_pending = NULL;
+		return dbus_error(msg, MESH_ERROR_ALREADY_EXISTS,
+							"Node already exists");
+	}
+
 	sender = l_dbus_message_get_sender(msg);
 
 	join_pending->sender = l_strdup(sender);
@@ -628,38 +628,29 @@ done:
 	return reply;
 }
 
-static bool match_attach_request(const void *a, const void *b)
-{
-	const struct attach_data *pending = a;
-	const uint64_t *token = b;
-
-	return *token == pending->token;
-}
-
-static void attach_ready_cb(int status, char *node_path, uint64_t token)
+static void attach_ready_cb(void *user_data, int status, struct mesh_node *node)
 {
 	struct l_dbus_message *reply;
-	struct attach_data *pending;
+	struct l_dbus_message *pending_msg;
 
-	pending = l_queue_find(attach_queue, match_attach_request, &token);
-	if (!pending)
+	pending_msg = l_queue_find(pending_queue, simple_match, user_data);
+	if (!pending_msg)
 		return;
 
 	if (status != MESH_ERROR_NONE) {
 		const char *desc = (status == MESH_ERROR_NOT_FOUND) ?
 				"Node match not found" : "Attach failed";
-		reply = dbus_error(pending->msg, status, desc);
+		reply = dbus_error(pending_msg, status, desc);
 		goto done;
 	}
 
-	reply = l_dbus_message_new_method_return(pending->msg);
+	reply = l_dbus_message_new_method_return(pending_msg);
 
-	node_build_attach_reply(reply, token);
+	node_build_attach_reply(node, reply);
 
 done:
 	l_dbus_send(dbus_get_bus(), reply);
-	l_queue_remove(attach_queue, pending);
-	l_free(pending);
+	l_queue_remove(pending_queue, pending_msg);
 }
 
 static struct l_dbus_message *attach_call(struct l_dbus *dbus,
@@ -668,7 +659,8 @@ static struct l_dbus_message *attach_call(struct l_dbus *dbus,
 {
 	uint64_t token;
 	const char *app_path, *sender;
-	struct attach_data *pending;
+	struct l_dbus_message *pending_msg;
+	int status;
 
 	l_debug("Attach");
 
@@ -677,22 +669,20 @@ static struct l_dbus_message *attach_call(struct l_dbus *dbus,
 
 	sender = l_dbus_message_get_sender(msg);
 
-	if (node_attach(app_path, sender, token, attach_ready_cb) !=
-								MESH_ERROR_NONE)
-		return dbus_error(msg, MESH_ERROR_NOT_FOUND,
-						"Matching node not found");
+	pending_msg = l_dbus_message_ref(msg);
+	if (!pending_queue)
+		pending_queue = l_queue_new();
 
-	pending = l_new(struct attach_data, 1);
+	l_queue_push_tail(pending_queue, pending_msg);
 
-	pending->token = token;
-	pending->msg = l_dbus_message_ref(msg);
+	status = node_attach(app_path, sender, token, attach_ready_cb,
+								pending_msg);
+	if (status == MESH_ERROR_NONE)
+		return NULL;
 
-	if (!attach_queue)
-		attach_queue = l_queue_new();
+	l_queue_remove(pending_queue, pending_msg);
 
-	l_queue_push_tail(attach_queue, pending);
-
-	return NULL;
+	return dbus_error(msg, status, NULL);
 }
 
 static struct l_dbus_message *leave_call(struct l_dbus *dbus,
@@ -711,6 +701,69 @@ static struct l_dbus_message *leave_call(struct l_dbus *dbus,
 	return l_dbus_message_new_method_return(msg);
 }
 
+static void create_network_ready_cb(void *user_data, int status,
+							struct mesh_node *node)
+{
+	struct l_dbus_message *reply;
+	struct l_dbus_message *pending_msg;
+	const uint8_t *token;
+
+	pending_msg = l_queue_find(pending_queue, simple_match, user_data);
+	if (!pending_msg)
+		return;
+
+	if (status != MESH_ERROR_NONE) {
+		reply = dbus_error(pending_msg, status, NULL);
+		goto done;
+	}
+
+	node_attach_io(node, mesh.io);
+
+	reply = l_dbus_message_new_method_return(pending_msg);
+	token = node_get_token(node);
+
+	l_debug();
+	l_dbus_message_set_arguments(reply, "t", l_get_be64(token));
+
+done:
+	l_dbus_send(dbus_get_bus(), reply);
+	l_queue_remove(pending_queue, pending_msg);
+}
+
+static struct l_dbus_message *create_network_call(struct l_dbus *dbus,
+						struct l_dbus_message *msg,
+						void *user_data)
+{
+	const char *app_path, *sender;
+	struct l_dbus_message_iter iter_uuid;
+	struct l_dbus_message *pending_msg;
+	uint8_t *uuid;
+	uint32_t n;
+
+	l_debug("Create network request");
+
+	if (!l_dbus_message_get_arguments(msg, "oay", &app_path,
+								&iter_uuid))
+		return dbus_error(msg, MESH_ERROR_INVALID_ARGS, NULL);
+
+	if (!l_dbus_message_iter_get_fixed_array(&iter_uuid, &uuid, &n)
+								|| n != 16)
+		return dbus_error(msg, MESH_ERROR_INVALID_ARGS,
+							"Bad device UUID");
+
+	sender = l_dbus_message_get_sender(msg);
+	pending_msg = l_dbus_message_ref(msg);
+	if (!pending_queue)
+		pending_queue = l_queue_new();
+
+	l_queue_push_tail(pending_queue, pending_msg);
+
+	node_create(app_path, sender, uuid, create_network_ready_cb,
+								pending_msg);
+
+	return NULL;
+}
+
 static void setup_network_interface(struct l_dbus_interface *iface)
 {
 	l_dbus_interface_method(iface, "Join", 0, join_network_call, "",
@@ -724,6 +777,8 @@ static void setup_network_interface(struct l_dbus_interface *iface)
 
 	l_dbus_interface_method(iface, "Leave", 0, leave_call, "", "t",
 								"token");
+	l_dbus_interface_method(iface, "CreateNetwork", 0, create_network_call,
+					"t", "oay", "token", "app", "uuid");
 }
 
 bool mesh_dbus_init(struct l_dbus *dbus)

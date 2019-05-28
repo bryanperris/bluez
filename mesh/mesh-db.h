@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -76,7 +76,6 @@ struct mesh_db_node {
 	uint16_t unicast;
 	uint8_t ttl;
 	struct l_queue *elements;
-	uint8_t uuid[16];
 };
 
 struct mesh_db_prov {

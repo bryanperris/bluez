@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -23,7 +23,6 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1464,10 +1463,6 @@ bool mesh_db_add_node(json_object *jnode, struct mesh_db_node *node) {
 		return false;
 
 	if (!mesh_db_write_uint16_hex(jnode, "crpl", node->crpl))
-		return false;
-
-	/* Device UUID */
-	if (!add_key_value(jnode, "UUID", node->uuid))
 		return false;
 
 	/* Features: relay, LPN, friend, proxy*/

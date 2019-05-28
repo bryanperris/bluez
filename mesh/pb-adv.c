@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -21,25 +21,9 @@
 #include <config.h>
 #endif
 
-#include <sys/select.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
-
-#include <ctype.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <getopt.h>
-#include <time.h>
 #include <ell/ell.h>
 
 #include "mesh/mesh-defs.h"
-#include "src/shared/ecc.h"
-
-#include "mesh/util.h"
-#include "mesh/net-keys.h"
 #include "mesh/crypto.h"
 #include "mesh/net.h"
 #include "mesh/mesh-io.h"
