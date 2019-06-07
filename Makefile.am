@@ -22,7 +22,7 @@ EXTRA_DIST =
 
 pkglibexecdir = $(libexecdir)/bluetooth
 
-libexec_PROGRAMS =
+pkglibexec_PROGRAMS =
 
 pkgincludedir = $(includedir)/bluetooth
 
@@ -116,6 +116,8 @@ ell_headers = ell/util.h \
 			ell/random.h \
 			ell/signal.h \
 			ell/timeout.h \
+			ell/cipher.h \
+			ell/checksum.h \
 			ell/io.h \
 			ell/idle.h \
 			ell/main.h \
@@ -138,6 +140,8 @@ ell_sources = ell/private.h ell/missing.h \
 			ell/main.c \
 			ell/strv.c \
 			ell/string.c \
+			ell/cipher.c \
+			ell/checksum.c \
 			ell/dbus-private.h \
 			ell/dbus.c \
 			ell/dbus-message.c \
@@ -238,7 +242,7 @@ plugins_external_dummy_la_LDFLAGS = $(AM_LDFLAGS) -module -avoid-version \
 plugins_external_dummy_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
 endif
 
-libexec_PROGRAMS += src/bluetoothd
+pkglibexec_PROGRAMS += src/bluetoothd
 
 src_bluetoothd_SOURCES = $(builtin_sources) \
 			$(attrib_sources) $(btio_sources) \
