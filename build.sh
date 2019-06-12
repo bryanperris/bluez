@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ -f config.status ]; then
-	make maintainer-clean
+	sudo make maintainer-clean
 fi
 
 ./bootstrap
@@ -11,7 +11,7 @@ fi
 	--sysconfdir=/etc \
 	--localstatedir=/var \
     --enable-external-ell \
-    --with-package=ell
+    --with-package=ell \
 	--enable-mesh \
 	--enable-debug \
 	--enable-experimental \
@@ -19,7 +19,8 @@ fi
 	--enable-logger \
 	--disable-datafiles
 	--enable-library \
-	--enable-maintainer-mode \
+	--enable-maintainer-mode
+
 make -j4
 sudo make install
 
