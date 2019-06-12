@@ -10,6 +10,8 @@ fi
 	--mandir=/usr/share/man \
 	--sysconfdir=/etc \
 	--localstatedir=/var \
+    --enable-external-ell \
+    --with-package=ell
 	--enable-mesh \
 	--enable-debug \
 	--enable-experimental \
@@ -17,8 +19,7 @@ fi
 	--enable-logger \
 	--disable-datafiles
 	--enable-library \
-	--enable-maintainer-mode
-
+	--enable-maintainer-mode \
 make -j4
 sudo make install
 
