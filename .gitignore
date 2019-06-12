@@ -187,3 +187,5 @@ android/test-*.trs
 cscope.in.out
 cscope.out
 cscope.po.out
+
+mesh/bluetooth-mesh\.service
