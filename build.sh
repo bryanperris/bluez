@@ -1,13 +1,27 @@
 #!/bin/bash
-./bootstrap-configure
-./configure --prefix=/opt/bluez --mandir=/opt/bluez/share/man --sysconfdir=/etc --localstatedir=/var --enable-mesh --enable-external-ell --with-package=ell
-make clean
-make
-sudo rm -rf /opt/bluez
+
+if [ -f config.status ]; then
+	make maintainer-clean
+fi
+
+./bootstrap
+
+./configure --prefix=/usr \
+	--mandir=/usr/share/man \
+	--sysconfdir=/etc \
+	--localstatedir=/var \
+	--enable-mesh \
+	--enable-debug \
+	--enable-experimental \
+	--enable-tools \
+	--enable-logger \
+	--disable-datafiles
+	--enable-library \
+	--enable-maintainer-mode
+
+make -j4
 sudo make install
-sudo cp custom.bluetooth.service /etc/systemd/system/bluetooth.target.wants/bluetooth.service
-mkdir ~/.config/meshctl
-cp tools/mesh/prov_db.json ~/.config/meshctl
-cp tools/mesh/local_node.json ~/.config/meshctl
+
+sudo ln -sf /usr/libexec/bluetooth/bluetoothd /usr/lib/bluetooth/bluetoothd
 sudo systemctl daemon-reload
 sudo service bluetooth restart
