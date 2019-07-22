@@ -43,7 +43,7 @@ const char *net_key_dir = "/net_keys";
 bool keyring_put_net_key(struct mesh_node *node, uint16_t net_idx,
 						struct keyring_net_key *key)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = false;
 	int fd;
@@ -51,7 +51,7 @@ bool keyring_put_net_key(struct mesh_node *node, uint16_t net_idx,
 	if (!node || !key)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 
 	if (strlen(node_path) + strlen(net_key_dir) + 1 + 3 >= PATH_MAX)
 		return false;
@@ -76,7 +76,7 @@ bool keyring_put_net_key(struct mesh_node *node, uint16_t net_idx,
 bool keyring_put_app_key(struct mesh_node *node, uint16_t app_idx,
 				uint16_t net_idx, struct keyring_app_key *key)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = false;
 	int fd;
@@ -84,7 +84,7 @@ bool keyring_put_app_key(struct mesh_node *node, uint16_t app_idx,
 	if (!node || !key)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 
 	if (strlen(node_path) + strlen(app_key_dir) + 1 + 3 >= PATH_MAX)
 		return false;
@@ -123,15 +123,18 @@ bool keyring_put_app_key(struct mesh_node *node, uint16_t app_idx,
 bool keyring_put_remote_dev_key(struct mesh_node *node, uint16_t unicast,
 					uint8_t count, uint8_t dev_key[16])
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = true;
 	int fd, i;
 
+	if (!IS_UNICAST_RANGE(unicast, count))
+		return false;
+
 	if (!node)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 
 	if (strlen(node_path) + strlen(dev_key_dir) + 1 + 4 >= PATH_MAX)
 		return false;
@@ -161,7 +164,7 @@ bool keyring_put_remote_dev_key(struct mesh_node *node, uint16_t unicast,
 bool keyring_get_net_key(struct mesh_node *node, uint16_t net_idx,
 						struct keyring_net_key *key)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = false;
 	int fd;
@@ -169,7 +172,7 @@ bool keyring_get_net_key(struct mesh_node *node, uint16_t net_idx,
 	if (!node || !key)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 	snprintf(key_file, PATH_MAX, "%s%s/%3.3x", node_path, net_key_dir,
 								net_idx);
 
@@ -187,7 +190,7 @@ bool keyring_get_net_key(struct mesh_node *node, uint16_t net_idx,
 bool keyring_get_app_key(struct mesh_node *node, uint16_t app_idx,
 						struct keyring_app_key *key)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = false;
 	int fd;
@@ -195,7 +198,7 @@ bool keyring_get_app_key(struct mesh_node *node, uint16_t app_idx,
 	if (!node || !key)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 	snprintf(key_file, PATH_MAX, "%s%s/%3.3x", node_path, app_key_dir,
 								app_idx);
 
@@ -213,15 +216,19 @@ bool keyring_get_app_key(struct mesh_node *node, uint16_t app_idx,
 bool keyring_get_remote_dev_key(struct mesh_node *node, uint16_t unicast,
 							uint8_t dev_key[16])
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	bool result = false;
 	int fd;
 
+	if (!IS_UNICAST(unicast))
+		return false;
+
 	if (!node)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
+
 	snprintf(key_file, PATH_MAX, "%s%s/%4.4x", node_path, dev_key_dir,
 								unicast);
 
@@ -238,13 +245,13 @@ bool keyring_get_remote_dev_key(struct mesh_node *node, uint16_t unicast,
 
 bool keyring_del_net_key(struct mesh_node *node, uint16_t net_idx)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 
 	if (!node)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 	snprintf(key_file, PATH_MAX, "%s%s/%3.3x", node_path, net_key_dir,
 								net_idx);
 	l_debug("RM Net Key %s", key_file);
@@ -258,13 +265,13 @@ bool keyring_del_net_key(struct mesh_node *node, uint16_t net_idx)
 
 bool keyring_del_app_key(struct mesh_node *node, uint16_t app_idx)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 
 	if (!node)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
 	snprintf(key_file, PATH_MAX, "%s%s/%3.3x", node_path, app_key_dir,
 								app_idx);
 	l_debug("RM App Key %s", key_file);
@@ -276,14 +283,18 @@ bool keyring_del_app_key(struct mesh_node *node, uint16_t app_idx)
 bool keyring_del_remote_dev_key(struct mesh_node *node, uint16_t unicast,
 								uint8_t count)
 {
-	char *node_path;
+	const char *node_path;
 	char key_file[PATH_MAX];
 	int i;
+
+	if (!IS_UNICAST_RANGE(unicast, count))
+		return false;
 
 	if (!node)
 		return false;
 
-	node_path = node_path_get(node);
+	node_path = node_get_storage_dir(node);
+
 	for (i = 0; i < count; i++) {
 		snprintf(key_file, PATH_MAX, "%s%s/%4.4x", node_path,
 						dev_key_dir, unicast + i);

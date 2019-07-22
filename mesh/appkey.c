@@ -31,7 +31,7 @@
 #include "mesh/crypto.h"
 #include "mesh/util.h"
 #include "mesh/model.h"
-#include "mesh/storage.h"
+#include "mesh/mesh-config.h"
 #include "mesh/appkey.h"
 
 struct mesh_app_key {
@@ -39,9 +39,9 @@ struct mesh_app_key {
 	uint16_t net_idx;
 	uint16_t app_idx;
 	uint8_t key[16];
-	uint8_t key_id;
+	uint8_t key_aid;
 	uint8_t new_key[16];
-	uint8_t new_key_id;
+	uint8_t new_key_aid;
 };
 
 struct mesh_msg {
@@ -62,7 +62,7 @@ struct mod_decrypt {
 	uint16_t idx;
 	uint16_t size;
 	uint16_t virt_size;
-	uint8_t key_id;
+	uint8_t key_aid;
 	bool szmict;
 	bool decrypted;
 };
@@ -108,16 +108,16 @@ static void packet_decrypt(void *a, void *b)
 	if (dec->decrypted)
 		return;
 
-	if (key->key_id != dec->key_id &&
-			key->new_key_id != dec->key_id)
+	if (key->key_aid != dec->key_aid &&
+			key->new_key_aid != dec->key_aid)
 		return;
 
 	dec->key = key;
 
-	if (key->key_id == dec->key_id) {
+	if (key->key_aid == dec->key_aid) {
 		dec->decrypted = mesh_crypto_payload_decrypt(dec->virt,
 				dec->virt_size, dec->data, dec->size,
-				dec->szmict, dec->src, dec->dst, dec->key_id,
+				dec->szmict, dec->src, dec->dst, dec->key_aid,
 				dec->seq, dec->iv_idx, dec->out, key->key);
 		if (dec->decrypted)
 			print_packet("Used App Key", dec->key->key, 16);
@@ -125,10 +125,10 @@ static void packet_decrypt(void *a, void *b)
 			print_packet("Failed with App Key", dec->key->key, 16);
 	}
 
-	if (!dec->decrypted && key->new_key_id == dec->key_id) {
+	if (!dec->decrypted && key->new_key_aid == dec->key_aid) {
 		dec->decrypted = mesh_crypto_payload_decrypt(dec->virt,
 				dec->virt_size, dec->data, dec->size,
-				dec->szmict, dec->src, dec->dst, dec->key_id,
+				dec->szmict, dec->src, dec->dst, dec->key_aid,
 				dec->seq, dec->iv_idx, dec->out, key->new_key);
 		if (dec->decrypted)
 			print_packet("Used App Key", dec->key->new_key, 16);
@@ -144,7 +144,7 @@ static void packet_decrypt(void *a, void *b)
 int appkey_packet_decrypt(struct mesh_net *net, bool szmict, uint32_t seq,
 				uint32_t iv_index, uint16_t src,
 				uint16_t dst, uint8_t *virt, uint16_t virt_size,
-				uint8_t key_id, const uint8_t *data,
+				uint8_t key_aid, const uint8_t *data,
 				uint16_t data_size, uint8_t *out)
 {
 	struct l_queue *app_keys;
@@ -156,7 +156,7 @@ int appkey_packet_decrypt(struct mesh_net *net, bool szmict, uint32_t seq,
 		.data = data,
 		.out = out,
 		.size = data_size,
-		.key_id = key_id,
+		.key_aid = key_aid,
 		.iv_idx = iv_index,
 		.virt = virt,
 		.virt_size = virt_size,
@@ -244,7 +244,7 @@ static struct mesh_app_key *app_key_new(void)
 {
 	struct mesh_app_key *key = l_new(struct mesh_app_key, 1);
 
-	key->new_key_id = 0xFF;
+	key->new_key_aid = 0xFF;
 	key->replay_cache = l_queue_new();
 	return key;
 }
@@ -252,16 +252,16 @@ static struct mesh_app_key *app_key_new(void)
 static bool set_key(struct mesh_app_key *key, uint16_t app_idx,
 			const uint8_t *key_value, bool is_new)
 {
-	uint8_t key_id;
+	uint8_t key_aid;
 
-	if (!mesh_crypto_k4(key_value, &key_id))
+	if (!mesh_crypto_k4(key_value, &key_aid))
 		return false;
 
-	key_id = KEY_ID_AKF | (key_id << KEY_AID_SHIFT);
+	key_aid = KEY_ID_AKF | (key_aid << KEY_AID_SHIFT);
 	if (!is_new)
-		key->key_id = key_id;
+		key->key_aid = key_aid;
 	else
-		key->new_key_id = key_id;
+		key->new_key_aid = key_aid;
 
 	memcpy(is_new ? key->new_key : key->key, key_value, 16);
 
@@ -314,7 +314,7 @@ bool appkey_key_init(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
 }
 
 const uint8_t *appkey_get_key(struct mesh_net *net, uint16_t app_idx,
-							uint8_t *key_id)
+							uint8_t *key_aid)
 {
 	struct mesh_app_key *app_key;
 	uint8_t phase;
@@ -334,14 +334,14 @@ const uint8_t *appkey_get_key(struct mesh_net *net, uint16_t app_idx,
 		return NULL;
 
 	if (phase != KEY_REFRESH_PHASE_TWO) {
-		*key_id = app_key->key_id;
+		*key_aid = app_key->key_aid;
 		return app_key->key;
 	}
 
-	if (app_key->new_key_id == NET_NID_INVALID)
+	if (app_key->new_key_aid == NET_NID_INVALID)
 		return NULL;
 
-	*key_id = app_key->new_key_id;
+	*key_aid = app_key->new_key_aid;
 	return app_key->new_key;
 }
 
@@ -362,12 +362,30 @@ bool appkey_have_key(struct mesh_net *net, uint16_t app_idx)
 		return true;
 }
 
+uint16_t appkey_net_idx(struct mesh_net *net, uint16_t app_idx)
+{
+	struct mesh_app_key *key;
+	struct l_queue *app_keys;
+
+	app_keys = mesh_net_get_app_keys(net);
+	if (!app_keys)
+		return NET_IDX_INVALID;
+
+	key = l_queue_find(app_keys, match_key_index, L_UINT_TO_PTR(app_idx));
+
+	if (!key)
+		return NET_IDX_INVALID;
+	else
+		return key->net_idx;
+}
+
 int appkey_key_update(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
 							const uint8_t *new_key)
 {
 	struct mesh_app_key *key;
 	struct l_queue *app_keys;
 	uint8_t phase = KEY_REFRESH_PHASE_NONE;
+	struct mesh_node *node;
 
 	app_keys = mesh_net_get_app_keys(net);
 	if (!app_keys)
@@ -395,7 +413,10 @@ int appkey_key_update(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
 	if (!set_key(key, app_idx, new_key, true))
 		return MESH_STATUS_INSUFF_RESOURCES;
 
-	if (!storage_app_key_add(net, net_idx, app_idx, new_key, true))
+	node = mesh_net_node_get(net);
+
+	if (!mesh_config_app_key_update(node_config_get(node), app_idx,
+								new_key))
 		return MESH_STATUS_STORAGE_FAIL;
 
 	return MESH_STATUS_SUCCESS;
@@ -406,6 +427,7 @@ int appkey_key_add(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
 {
 	struct mesh_app_key *key;
 	struct l_queue *app_keys;
+	struct mesh_node *node;
 
 	app_keys = mesh_net_get_app_keys(net);
 	if (!app_keys)
@@ -432,7 +454,10 @@ int appkey_key_add(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
 		return MESH_STATUS_INSUFF_RESOURCES;
 	}
 
-	if (!storage_app_key_add(net, net_idx, app_idx, new_key, false)) {
+	node = mesh_net_node_get(net);
+
+	if (!mesh_config_app_key_add(node_config_get(node), net_idx, app_idx,
+								new_key)) {
 		appkey_key_free(key);
 		return MESH_STATUS_STORAGE_FAIL;
 	}
@@ -451,6 +476,7 @@ int appkey_key_delete(struct mesh_net *net, uint16_t net_idx,
 {
 	struct mesh_app_key *key;
 	struct l_queue *app_keys;
+	struct mesh_node *node;
 
 	app_keys = mesh_net_get_app_keys(net);
 	if (!app_keys)
@@ -469,7 +495,9 @@ int appkey_key_delete(struct mesh_net *net, uint16_t net_idx,
 	l_queue_remove(app_keys, key);
 	appkey_key_free(key);
 
-	if (!storage_app_key_del(net, net_idx, app_idx))
+	node = mesh_net_node_get(net);
+
+	if (!mesh_config_app_key_del(node_config_get(node), net_idx, app_idx))
 		return MESH_STATUS_STORAGE_FAIL;
 
 	return MESH_STATUS_SUCCESS;

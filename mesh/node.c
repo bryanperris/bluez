@@ -22,18 +22,19 @@
 #endif
 
 #define _GNU_SOURCE
+#include <dirent.h>
+#include <stdio.h>
 
 #include <sys/time.h>
 
 #include <ell/ell.h>
-#include <json-c/json.h>
 
 #include "mesh/mesh-defs.h"
 #include "mesh/mesh.h"
 #include "mesh/net.h"
-#include "mesh/mesh-db.h"
+#include "mesh/appkey.h"
+#include "mesh/mesh-config.h"
 #include "mesh/provision.h"
-#include "mesh/storage.h"
 #include "mesh/keyring.h"
 #include "mesh/model.h"
 #include "mesh/cfgmod.h"
@@ -80,9 +81,11 @@ struct mesh_node {
 	struct l_queue *elements;
 	char *app_path;
 	char *owner;
+	char *obj_path;
+	struct mesh_agent *agent;
 	char *path;
-	void *jconfig;
-	char *node_path;
+	struct mesh_config *cfg;
+	char *storage_dir;
 	uint32_t disc_watch;
 	time_t upd_sec;
 	uint32_t seq_number;
@@ -193,7 +196,7 @@ uint8_t *node_uuid_get(struct mesh_node *node)
 	return node->uuid;
 }
 
-struct mesh_node *node_new(const uint8_t uuid[16])
+static struct mesh_node *node_new(const uint8_t uuid[16])
 {
 	struct mesh_node *node;
 
@@ -242,14 +245,14 @@ static void free_node_dbus_resources(struct mesh_node *node)
 	l_free(node->app_path);
 	node->app_path = NULL;
 
-	if (node->path) {
-		l_dbus_object_remove_interface(dbus_get_bus(), node->path,
+	if (node->obj_path) {
+		l_dbus_object_remove_interface(dbus_get_bus(), node->obj_path,
 							MESH_NODE_INTERFACE);
 
-		l_dbus_object_remove_interface(dbus_get_bus(), node->path,
+		l_dbus_object_remove_interface(dbus_get_bus(), node->obj_path,
 						MESH_MANAGEMENT_INTERFACE);
-		l_free(node->path);
-		node->path = NULL;
+		l_free(node->obj_path);
+		node->obj_path = NULL;
 	}
 }
 
@@ -268,6 +271,7 @@ static void free_node_resources(void *data)
 
 	mesh_net_free(node->net);
 	l_free(node->comp);
+	l_free(node->storage_dir);
 	l_free(node);
 }
 
@@ -282,14 +286,14 @@ void node_remove(struct mesh_node *node)
 
 	l_queue_remove(nodes, node);
 
-	if (node->node_path)
-		storage_remove_node_config(node);
+	if (node->cfg)
+		mesh_config_destroy(node->cfg);
 
 	free_node_resources(node);
 }
 
 static bool add_models(struct mesh_node *node, struct node_element *ele,
-						struct mesh_db_element *db_ele)
+					struct mesh_config_element *db_ele)
 {
 	const struct l_queue_entry *entry;
 
@@ -299,7 +303,7 @@ static bool add_models(struct mesh_node *node, struct node_element *ele,
 	entry = l_queue_get_entries(db_ele->models);
 	for (; entry; entry = entry->next) {
 		struct mesh_model *mod;
-		struct mesh_db_model *db_mod;
+		struct mesh_config_model *db_mod;
 
 		db_mod = entry->data;
 		mod = mesh_model_setup(node, ele->idx, db_mod);
@@ -317,7 +321,7 @@ static void add_internal_model(struct mesh_node *node, uint32_t mod_id,
 {
 	struct node_element *ele;
 	struct mesh_model *mod;
-	struct mesh_db_model db_mod;
+	struct mesh_config_model db_mod;
 
 	ele = l_queue_find(node->elements, match_element_idx,
 							L_UINT_TO_PTR(ele_idx));
@@ -338,7 +342,8 @@ static void add_internal_model(struct mesh_node *node, uint32_t mod_id,
 	l_queue_push_tail(ele->models, mod);
 }
 
-static bool add_element(struct mesh_node *node, struct mesh_db_element *db_ele)
+static bool add_element(struct mesh_node *node,
+					struct mesh_config_element *db_ele)
 {
 	struct node_element *ele;
 
@@ -356,7 +361,8 @@ static bool add_element(struct mesh_node *node, struct mesh_db_element *db_ele)
 	return true;
 }
 
-static bool add_elements(struct mesh_node *node, struct mesh_db_node *db_node)
+static bool add_elements(struct mesh_node *node,
+					struct mesh_config_node *db_node)
 {
 	const struct l_queue_entry *entry;
 
@@ -371,10 +377,32 @@ static bool add_elements(struct mesh_node *node, struct mesh_db_node *db_node)
 	return true;
 }
 
-bool node_init_from_storage(struct mesh_node *node, void *data)
+static void set_net_key(void *a, void *b)
 {
-	struct mesh_db_node *db_node = data;
+	struct mesh_config_netkey *netkey = a;
+	struct mesh_node *node = b;
+
+	mesh_net_set_key(node->net, netkey->idx, netkey->key, netkey->new_key,
+								netkey->phase);
+}
+
+static void set_app_key(void *a, void *b)
+{
+	struct mesh_config_appkey *appkey = a;
+	struct mesh_node *node = b;
+
+	appkey_key_init(node->net, appkey->net_idx, appkey->app_idx,
+						appkey->key, appkey->new_key);
+}
+
+static bool init_from_storage(struct mesh_config_node *db_node,
+			const uint8_t uuid[16], struct mesh_config *cfg,
+			void *user_data)
+{
 	unsigned int num_ele;
+	uint8_t mode;
+
+	struct mesh_node *node = node_new(uuid);
 
 	node->comp = l_new(struct node_composition, 1);
 	node->comp->cid = db_node->cid;
@@ -396,21 +424,68 @@ bool node_init_from_storage(struct mesh_node *node, void *data)
 	node->ttl = db_node->ttl;
 	node->seq_number = db_node->seq_number;
 
+	memcpy(node->dev_key, db_node->dev_key, 16);
+	memcpy(node->token, db_node->token, 8);
+
 	num_ele = l_queue_length(db_node->elements);
 	if (num_ele > 0xff)
-		return false;
+		goto fail;
 
 	node->num_ele = num_ele;
 
 	if (num_ele != 0 && !add_elements(node, db_node))
-		return false;
+		goto fail;
 
 	node->primary = db_node->unicast;
 
+	if (!db_node->netkeys)
+		goto fail;
+
+	mesh_net_set_iv_index(node->net, db_node->iv_index, db_node->iv_update);
+
+	if (db_node->net_transmit)
+		mesh_net_transmit_params_set(node->net,
+					db_node->net_transmit->count,
+					db_node->net_transmit->interval);
+
+	l_queue_foreach(db_node->netkeys, set_net_key, node);
+
+	if (db_node->appkeys)
+		l_queue_foreach(db_node->appkeys, set_app_key, node);
+
+	mesh_net_set_seq_num(node->net, node->seq_number);
+	mesh_net_set_default_ttl(node->net, node->ttl);
+
+	mode = node->proxy;
+	if (mode == MESH_MODE_ENABLED || mode == MESH_MODE_DISABLED)
+		mesh_net_set_proxy_mode(node->net, mode == MESH_MODE_ENABLED);
+
+	mode = node->lpn;
+	if (mode == MESH_MODE_ENABLED || mode == MESH_MODE_DISABLED)
+		mesh_net_set_friend_mode(node->net, mode == MESH_MODE_ENABLED);
+
+	mode = node->relay.mode;
+	if (mode == MESH_MODE_ENABLED || mode == MESH_MODE_DISABLED)
+		mesh_net_set_relay_mode(node->net, mode == MESH_MODE_ENABLED,
+					node->relay.cnt, node->relay.interval);
+
+	mode = node->beacon;
+	if (mode == MESH_MODE_ENABLED || mode == MESH_MODE_DISABLED)
+		mesh_net_set_beacon_mode(node->net, mode == MESH_MODE_ENABLED);
+
+	if (!IS_UNASSIGNED(node->primary) &&
+		!mesh_net_register_unicast(node->net, node->primary, num_ele))
+		goto fail;
+
 	/* Initialize configuration server model */
-	mesh_config_srv_init(node, PRIMARY_ELE_IDX);
+	cfgmod_server_init(node, PRIMARY_ELE_IDX);
+
+	node->cfg = cfg;
 
 	return true;
+fail:
+	node_remove(node);
+	return false;
 }
 
 static void cleanup_node(void *data)
@@ -419,12 +494,13 @@ static void cleanup_node(void *data)
 	struct mesh_net *net = node->net;
 
 	/* Save local node configuration */
-	if (node->node_path) {
+	if (node->cfg) {
 
 		/* Preserve the last sequence number */
-		storage_write_sequence_number(net, mesh_net_get_seq_num(net));
+		mesh_config_write_seq_number(node->cfg,
+						mesh_net_get_seq_num(net));
 
-		storage_save_config(node, true, NULL, NULL);
+		mesh_config_save(node->cfg, true, NULL, NULL);
 	}
 
 	free_node_resources(node);
@@ -439,6 +515,11 @@ void node_cleanup_all(void)
 	l_queue_destroy(nodes, cleanup_node);
 	l_dbus_unregister_interface(dbus_get_bus(), MESH_NODE_INTERFACE);
 	l_dbus_unregister_interface(dbus_get_bus(), MESH_MANAGEMENT_INTERFACE);
+}
+
+bool node_is_provisioner(struct mesh_node *node)
+{
+	return node->provisioner;
 }
 
 bool node_is_provisioned(struct mesh_node *node)
@@ -462,7 +543,8 @@ bool node_app_key_delete(struct mesh_net *net, uint16_t addr,
 
 		mesh_model_app_key_delete(node, ele->models, app_idx);
 	}
-	return true;
+
+	return mesh_config_app_key_del(node->cfg, net_idx, app_idx);
 }
 
 uint16_t node_get_primary(struct mesh_node *node)
@@ -543,7 +625,7 @@ bool node_default_ttl_set(struct mesh_node *node, uint8_t ttl)
 	if (!node)
 		return false;
 
-	res = storage_set_ttl(node, ttl);
+	res = mesh_config_write_ttl(node->cfg, ttl);
 
 	if (res) {
 		node->ttl = ttl;
@@ -590,7 +672,7 @@ bool node_set_sequence_number(struct mesh_node *node, uint32_t seq)
 
 	node->upd_sec = write_time.tv_sec;
 
-	return storage_write_sequence_number(node->net, seq);
+	return mesh_config_write_seq_number(node->cfg, seq);
 }
 
 uint32_t node_get_sequence_number(struct mesh_node *node)
@@ -667,7 +749,7 @@ bool node_relay_mode_set(struct mesh_node *node, bool enable, uint8_t cnt,
 	if (!node || node->relay.mode == MESH_MODE_UNSUPPORTED)
 		return false;
 
-	res = storage_set_relay(node, enable, cnt, interval);
+	res = mesh_config_write_relay_mode(node->cfg, enable, cnt, interval);
 
 	if (res) {
 		node->relay.mode = enable ? MESH_MODE_ENABLED :
@@ -689,7 +771,7 @@ bool node_proxy_mode_set(struct mesh_node *node, bool enable)
 		return false;
 
 	proxy = enable ? MESH_MODE_ENABLED : MESH_MODE_DISABLED;
-	res = storage_set_mode(node->jconfig, proxy, "proxy");
+	res = mesh_config_write_mode(node->cfg, "proxy", proxy);
 
 	if (res) {
 		node->proxy = proxy;
@@ -716,7 +798,7 @@ bool node_beacon_mode_set(struct mesh_node *node, bool enable)
 		return false;
 
 	beacon = enable ? MESH_MODE_ENABLED : MESH_MODE_DISABLED;
-	res = storage_set_mode(node->jconfig, beacon, "beacon");
+	res = mesh_config_write_mode(node->cfg, "beacon", beacon);
 
 	if (res) {
 		node->beacon = beacon;
@@ -743,7 +825,7 @@ bool node_friend_mode_set(struct mesh_node *node, bool enable)
 		return false;
 
 	friend = enable ? MESH_MODE_ENABLED : MESH_MODE_DISABLED;
-	res = storage_set_mode(node->jconfig, friend, "friend");
+	res = mesh_config_write_mode(node->cfg, "friend", friend);
 
 	if (res) {
 		node->friend = friend;
@@ -1026,14 +1108,14 @@ static bool register_node_object(struct mesh_node *node)
 	if (!hex2str(node->uuid, sizeof(node->uuid), uuid, sizeof(uuid)))
 		return false;
 
-	node->path = l_strdup_printf(BLUEZ_MESH_PATH MESH_NODE_PATH_PREFIX
+	node->obj_path = l_strdup_printf(BLUEZ_MESH_PATH MESH_NODE_PATH_PREFIX
 								"%s", uuid);
 
-	if (!l_dbus_object_add_interface(dbus_get_bus(), node->path,
+	if (!l_dbus_object_add_interface(dbus_get_bus(), node->obj_path,
 						MESH_NODE_INTERFACE, node))
 		return false;
 
-	if (!l_dbus_object_add_interface(dbus_get_bus(), node->path,
+	if (!l_dbus_object_add_interface(dbus_get_bus(), node->obj_path,
 					MESH_MANAGEMENT_INTERFACE, node))
 		return false;
 
@@ -1232,7 +1314,7 @@ static bool get_element_properties(struct mesh_node *node, const char *path,
 }
 
 static void convert_node_to_storage(struct mesh_node *node,
-						struct mesh_db_node *db_node)
+					struct mesh_config_node *db_node)
 {
 	const struct l_queue_entry *entry;
 
@@ -1258,10 +1340,10 @@ static void convert_node_to_storage(struct mesh_node *node,
 
 	for (; entry; entry = entry->next) {
 		struct node_element *ele = entry->data;
-		struct mesh_db_element *db_ele;
+		struct mesh_config_element *db_ele;
 		const struct l_queue_entry *mod_entry;
 
-		db_ele = l_new(struct mesh_db_element, 1);
+		db_ele = l_new(struct mesh_config_element, 1);
 
 		db_ele->index = ele->idx;
 		db_ele->location = ele->location;
@@ -1271,10 +1353,10 @@ static void convert_node_to_storage(struct mesh_node *node,
 
 		for (; mod_entry; mod_entry = mod_entry->next) {
 			struct mesh_model *mod = mod_entry->data;
-			struct mesh_db_model *db_mod;
+			struct mesh_config_model *db_mod;
 			uint32_t mod_id = mesh_model_get_model_id(mod);
 
-			db_mod = l_new(struct mesh_db_model, 1);
+			db_mod = l_new(struct mesh_config_model, 1);
 			db_mod->id = mod_id;
 			db_mod->vendor = ((mod_id & VENDOR_ID_MASK)
 							!= VENDOR_ID_MASK);
@@ -1286,26 +1368,27 @@ static void convert_node_to_storage(struct mesh_node *node,
 
 }
 
-static bool create_node_config(struct mesh_node *node)
+static bool create_node_config(struct mesh_node *node, const uint8_t uuid[16])
 {
-	struct mesh_db_node db_node;
+	struct mesh_config_node db_node;
 	const struct l_queue_entry *entry;
-	bool res;
+	const char *storage_dir;
 
 	convert_node_to_storage(node, &db_node);
-	res = storage_create_node_config(node, &db_node);
+	storage_dir = mesh_get_storage_dir();
+	node->cfg = mesh_config_create(storage_dir, uuid, &db_node);
 
 	/* Free temporarily allocated resources */
 	entry = l_queue_get_entries(db_node.elements);
 	for (; entry; entry = entry->next) {
-		struct mesh_db_element *db_ele = entry->data;
+		struct mesh_config_element *db_ele = entry->data;
 
 		l_queue_destroy(db_ele->models, l_free);
 	}
 
 	l_queue_destroy(db_node.elements, l_free);
 
-	return res;
+	return node->cfg != NULL;
 }
 
 static void set_defaults(struct mesh_node *node)
@@ -1396,21 +1479,20 @@ static bool add_local_node(struct mesh_node *node, uint16_t unicast, bool kr,
 
 	l_queue_push_tail(nodes, node);
 
-	if (!storage_set_iv_index(node->net, iv_idx, ivu))
+	if (!mesh_config_write_iv_index(node->cfg, iv_idx, ivu))
 		return false;
 
 	mesh_net_set_iv_index(node->net, iv_idx, ivu);
 
-	if (!mesh_db_write_uint16_hex(node->jconfig, "unicastAddress",
-								unicast))
+	if (!mesh_config_write_unicast(node->cfg, unicast))
 		return false;
 
 	l_getrandom(node->token, sizeof(node->token));
-	if (!mesh_db_write_token(node->jconfig, node->token))
+	if (!mesh_config_write_token(node->cfg, node->token))
 		return false;
 
 	memcpy(node->dev_key, dev_key, 16);
-	if (!mesh_db_write_device_key(node->jconfig, dev_key))
+	if (!mesh_config_write_device_key(node->cfg, dev_key))
 		return false;
 
 	node->primary = unicast;
@@ -1426,15 +1508,38 @@ static bool add_local_node(struct mesh_node *node, uint16_t unicast, bool kr,
 							MESH_STATUS_SUCCESS)
 			return false;
 
-		if (!mesh_db_net_key_set_phase(node->jconfig, net_key_idx,
+		if (!mesh_config_net_key_set_phase(node->cfg, net_key_idx,
 							KEY_REFRESH_PHASE_TWO))
 			return false;
 	}
 
-	storage_save_config(node, true, NULL, NULL);
+	mesh_config_save(node->cfg, true, NULL, NULL);
 
 	/* Initialize configuration server model */
-	mesh_config_srv_init(node, PRIMARY_ELE_IDX);
+	cfgmod_server_init(node, PRIMARY_ELE_IDX);
+
+	return true;
+}
+
+static bool init_storage_dir(struct mesh_node *node)
+{
+	char uuid[33];
+	char dir_name[PATH_MAX];
+
+	if (node->storage_dir)
+		return true;
+
+	if (!hex2str(node->uuid, 16, uuid, sizeof(uuid)))
+		return false;
+
+	snprintf(dir_name, PATH_MAX, "%s/%s", mesh_get_storage_dir(), uuid);
+
+	if (strlen(dir_name) >= PATH_MAX)
+		return false;
+
+	create_dir(dir_name);
+
+	node->storage_dir = l_strdup(dir_name);
 
 	return true;
 }
@@ -1509,6 +1614,9 @@ static void get_managed_objects_cb(struct l_dbus_message *msg, void *user_data)
 								&properties);
 				if (!agent)
 					goto fail;
+
+				node->agent = agent;
+
 			} else if (!strcmp(MESH_PROVISIONER_INTERFACE,
 								interface)) {
 				node->provisioner = true;
@@ -1548,6 +1656,14 @@ static void get_managed_objects_cb(struct l_dbus_message *msg, void *user_data)
 		} else
 			goto fail;
 
+		/*
+		 * TODO: For now always initialize directory for storing
+		 * keyring info. Need to figure out what checks need
+		 * to be performed to do this conditionally, i.e., presence of
+		 * Provisioner interface, etc.
+		 */
+		init_storage_dir(node);
+
 	} else if (req->type == REQUEST_TYPE_JOIN) {
 		node_join_ready_func_t cb = req->cb;
 
@@ -1561,7 +1677,7 @@ static void get_managed_objects_cb(struct l_dbus_message *msg, void *user_data)
 		set_defaults(node);
 		memcpy(node->uuid, req->data, 16);
 
-		if (!create_node_config(node))
+		if (!create_node_config(node, node->uuid))
 			goto fail;
 
 		cb(node, agent);
@@ -1576,7 +1692,7 @@ static void get_managed_objects_cb(struct l_dbus_message *msg, void *user_data)
 		set_defaults(node);
 		memcpy(node->uuid, req->data, 16);
 
-		if (!create_node_config(node))
+		if (!create_node_config(node, node->uuid))
 			goto fail;
 
 		/* Generate device and primary network keys */
@@ -1590,6 +1706,9 @@ static void get_managed_objects_cb(struct l_dbus_message *msg, void *user_data)
 						PRIMARY_NET_IDX,
 						net_key.old_key))
 			goto fail;
+
+		/* Initialize directory for storing keyring info */
+		init_storage_dir(node);
 
 		if (!keyring_put_remote_dev_key(node, DEFAULT_NEW_UNICAST,
 							num_ele, dev_key))
@@ -1736,7 +1855,7 @@ void node_build_attach_reply(struct mesh_node *node,
 	builder = l_dbus_message_builder_new(reply);
 
 	/* Node object path */
-	l_dbus_message_builder_append_basic(builder, 'o', node->path);
+	l_dbus_message_builder_append_basic(builder, 'o', node->obj_path);
 
 	/* Array of element configurations "a*/
 	l_dbus_message_builder_enter_array(builder, "(ya(qa{sv}))");
@@ -1781,12 +1900,12 @@ static struct l_dbus_message *send_call(struct l_dbus *dbus,
 		return dbus_error(msg, MESH_ERROR_INVALID_ARGS,
 							"Incorrect data");
 
-	if ((app_idx & APP_IDX_MASK) != app_idx)
+	if (app_idx & ~APP_IDX_MASK)
 		return dbus_error(msg, MESH_ERROR_INVALID_ARGS,
 						"Invalid key_index");
 
-	if (!mesh_model_send(node, src, dst, app_idx & APP_IDX_MASK,
-				mesh_net_get_default_ttl(node->net), data, len))
+	if (!mesh_model_send(node, src, dst, app_idx, 0, DEFAULT_TTL,
+								data, len))
 		return dbus_error(msg, MESH_ERROR_FAILED, NULL);
 
 	return l_dbus_message_new_method_return(msg);
@@ -1828,8 +1947,8 @@ static struct l_dbus_message *dev_key_send_call(struct l_dbus *dbus,
 							"Incorrect data");
 
 	/* TODO: use net_idx */
-	if (!mesh_model_send(node, src, dst, APP_IDX_DEV_REMOTE,
-				mesh_net_get_default_ttl(node->net), data, len))
+	if (!mesh_model_send(node, src, dst, APP_IDX_DEV_REMOTE, net_idx,
+							DEFAULT_TTL, data, len))
 		return dbus_error(msg, MESH_ERROR_NOT_FOUND, NULL);
 
 	return l_dbus_message_new_method_return(msg);
@@ -1986,28 +2105,35 @@ bool node_add_pending_local(struct mesh_node *node, void *prov_node_info)
 			info->device_key, info->net_index, info->net_key);
 }
 
-void node_jconfig_set(struct mesh_node *node, void *jconfig)
+struct mesh_config *node_config_get(struct mesh_node *node)
 {
-	node->jconfig = jconfig;
+	return node->cfg;
 }
 
-void *node_jconfig_get(struct mesh_node *node)
+const char *node_get_storage_dir(struct mesh_node *node)
 {
-	return node->jconfig;
+	return node->storage_dir;
 }
 
-void node_path_set(struct mesh_node *node, char *path)
+const char *node_get_app_path(struct mesh_node *node)
 {
-	l_free(node->node_path);
-	node->node_path = l_strdup(path);
-}
+	if (!node)
+		return NULL;
 
-char *node_path_get(struct mesh_node *node)
-{
-	return node->node_path;
+	return node->app_path;
 }
 
 struct mesh_net *node_get_net(struct mesh_node *node)
 {
 	return node->net;
+}
+
+struct mesh_agent *node_get_agent(struct mesh_node *node)
+{
+	return node->agent;
+}
+
+bool node_load_from_storage(const char *storage_dir)
+{
+	return mesh_config_load_nodes(storage_dir, init_from_storage, NULL);
 }

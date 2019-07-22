@@ -28,9 +28,7 @@ struct mesh_node;
 
 #define UNUSED_KEY_IDX	0xffff
 
-#define APP_ID_DEV	0
-#define APP_ID_ANY	((unsigned int) -1)
-#define NET_ID_ANY	(APP_ID_ANY - 1)
+#define APP_AID_DEV	0x00
 
 #define CTL		0x80
 #define TTL_MASK	0x7f
@@ -302,9 +300,9 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t key_id,
 				const uint8_t *msg, uint16_t msg_len);
 
 bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
-				uint16_t dst, uint8_t key_id, uint8_t ttl,
-				uint32_t seq, uint32_t iv_index, bool szmic,
-				const void *msg, uint16_t msg_len,
+				uint16_t dst, uint8_t key_id, uint16_t net_idx,
+				uint8_t ttl, uint32_t seq, uint32_t iv_index,
+				bool szmic, const void *msg, uint16_t msg_len,
 				mesh_net_status_func_t status_func,
 				void *user_data);
 void mesh_net_ack_send(struct mesh_net *net, uint32_t key_id,
@@ -360,7 +358,8 @@ uint32_t mesh_net_friend_timeout(struct mesh_net *net, uint16_t addr);
 struct mesh_io *mesh_net_get_io(struct mesh_net *net);
 struct mesh_node *mesh_net_node_get(struct mesh_net *net);
 bool mesh_net_have_key(struct mesh_net *net, uint16_t net_idx);
-bool mesh_net_is_local_address(struct mesh_net *net, uint16_t addr);
+bool mesh_net_is_local_address(struct mesh_net *net, uint16_t src,
+							uint16_t count);
 void mesh_net_set_window_accuracy(struct mesh_net *net, uint8_t accuracy);
 void mesh_net_transmit_params_set(struct mesh_net *net, uint8_t count,
 							uint16_t interval);
