@@ -526,6 +526,9 @@ static GDBusProxy *select_proxy_by_uuid(GDBusProxy *parent, const char *uuid,
 
 		if (strcasecmp(uuid, value) == 0)
 			return proxy;
+
+		if (strlen(uuid) == 4 && !strncasecmp(value + 4, uuid, 4))
+			return proxy;
 	}
 
 	return NULL;
@@ -558,7 +561,7 @@ GDBusProxy *gatt_select_attribute(GDBusProxy *parent, const char *arg)
 			return proxy;
 	}
 
-	return select_attribute_by_uuid(parent, arg);
+	return select_attribute_by_uuid(NULL, arg);
 }
 
 static char *attribute_generator(const char *text, int state, GList *source)

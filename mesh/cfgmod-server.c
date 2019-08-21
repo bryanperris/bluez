@@ -93,7 +93,7 @@ static bool config_pub_get(struct mesh_node *node, uint16_t net_idx,
 	ele_idx = node_get_element_idx(node, ele_addr);
 
 	if (ele_idx >= 0)
-		pub = mesh_model_pub_get(node, ele_idx, mod_id, &status);
+		pub = mesh_model_pub_get(node, ele_addr, mod_id, &status);
 	else
 		status = MESH_STATUS_INVALID_ADDRESS;
 
@@ -872,8 +872,7 @@ static bool cfg_srv_pkt(uint16_t src, uint32_t dst, uint16_t unicast,
 
 		count = (pkt[1] >> 5) + 1;
 		interval = ((pkt[1] & 0x1f) + 1) * 10;
-		node_relay_mode_set(node, !!pkt[0], pkt[1]>>5,
-					pkt[1] & 0x1f);
+		node_relay_mode_set(node, !!pkt[0], count, interval);
 		/* Fall Through */
 
 	case OP_CONFIG_RELAY_GET:
