@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -835,17 +836,22 @@ bool mesh_config_app_key_del(struct mesh_config *cfg, uint16_t net_idx,
 	return save_config(jnode, cfg->node_dir_path);
 }
 
-bool mesh_config_model_binding_add(struct mesh_config *cfg, uint8_t ele_idx,
-					bool vendor, uint32_t mod_id,
+bool mesh_config_model_binding_add(struct mesh_config *cfg, uint16_t ele_addr,
+						bool vendor, uint32_t mod_id,
 							uint16_t app_idx)
 {
 	json_object *jnode, *jmodel, *jstring, *jarray = NULL;
+	int ele_idx;
 	char buf[5];
 
 	if (!cfg)
 		return false;
 
 	jnode = cfg->jnode;
+
+	ele_idx = get_element_index(jnode, ele_addr);
+	if (ele_idx < 0)
+		return false;
 
 	jmodel = get_element_model(jnode, ele_idx, mod_id, vendor);
 	if (!jmodel)
@@ -875,17 +881,22 @@ bool mesh_config_model_binding_add(struct mesh_config *cfg, uint8_t ele_idx,
 	return save_config(jnode, cfg->node_dir_path);
 }
 
-bool mesh_config_model_binding_del(struct mesh_config *cfg, uint8_t ele_idx,
-					bool vendor, uint32_t mod_id,
+bool mesh_config_model_binding_del(struct mesh_config *cfg, uint16_t ele_addr,
+						bool vendor, uint32_t mod_id,
 							uint16_t app_idx)
 {
 	json_object *jnode, *jmodel, *jarray, *jarray_new;
+	int ele_idx;
 	char buf[5];
 
 	if (!cfg)
 		return false;
 
 	jnode = cfg->jnode;
+
+	ele_idx = get_element_index(jnode, ele_addr);
+	if (ele_idx < 0)
+		return false;
 
 	jmodel = get_element_model(jnode, ele_idx, mod_id, vendor);
 	if (!jmodel)
@@ -1818,7 +1829,7 @@ bool mesh_config_net_key_set_phase(struct mesh_config *cfg, uint16_t idx,
 	return save_config(jnode, cfg->node_dir_path);
 }
 
-bool mesh_config_model_pub_add(struct mesh_config *cfg, uint16_t addr,
+bool mesh_config_model_pub_add(struct mesh_config *cfg, uint16_t ele_addr,
 					uint32_t mod_id, bool vendor,
 					struct mesh_config_pub *pub)
 {
@@ -1831,7 +1842,7 @@ bool mesh_config_model_pub_add(struct mesh_config *cfg, uint16_t addr,
 
 	jnode = cfg->jnode;
 
-	ele_idx = get_element_index(jnode, addr);
+	ele_idx = get_element_index(jnode, ele_addr);
 	if (ele_idx < 0)
 		return false;
 
@@ -1886,13 +1897,13 @@ fail:
 	return false;
 }
 
-static bool delete_model_property(json_object *jnode, uint16_t addr,
+static bool delete_model_property(json_object *jnode, uint16_t ele_addr,
 			uint32_t mod_id, bool vendor, const char *keyword)
 {
 	json_object *jmodel;
 	int ele_idx;
 
-	ele_idx = get_element_index(jnode, addr);
+	ele_idx = get_element_index(jnode, ele_addr);
 	if (ele_idx < 0)
 		return false;
 
@@ -1915,7 +1926,7 @@ bool mesh_config_model_pub_del(struct mesh_config *cfg, uint16_t addr,
 	return save_config(cfg->jnode, cfg->node_dir_path);
 }
 
-bool mesh_config_model_sub_add(struct mesh_config *cfg, uint16_t addr,
+bool mesh_config_model_sub_add(struct mesh_config *cfg, uint16_t ele_addr,
 						uint32_t mod_id, bool vendor,
 						struct mesh_config_sub *sub)
 {
@@ -1928,7 +1939,7 @@ bool mesh_config_model_sub_add(struct mesh_config *cfg, uint16_t addr,
 
 	jnode = cfg->jnode;
 
-	ele_idx = get_element_index(jnode, addr);
+	ele_idx = get_element_index(jnode, ele_addr);
 	if (ele_idx < 0)
 		return false;
 
@@ -1966,7 +1977,7 @@ bool mesh_config_model_sub_add(struct mesh_config *cfg, uint16_t addr,
 	return save_config(jnode, cfg->node_dir_path);
 }
 
-bool mesh_config_model_sub_del(struct mesh_config *cfg, uint16_t addr,
+bool mesh_config_model_sub_del(struct mesh_config *cfg, uint16_t ele_addr,
 						uint32_t mod_id, bool vendor,
 						struct mesh_config_sub *sub)
 {
@@ -1979,7 +1990,7 @@ bool mesh_config_model_sub_del(struct mesh_config *cfg, uint16_t addr,
 
 	jnode = cfg->jnode;
 
-	ele_idx = get_element_index(jnode, addr);
+	ele_idx = get_element_index(jnode, ele_addr);
 	if (ele_idx < 0)
 		return false;
 
@@ -2047,7 +2058,8 @@ bool mesh_config_write_seq_number(struct mesh_config *cfg, uint32_t seq,
 		return mesh_config_save(cfg, true, NULL, NULL);
 	}
 
-	if (get_int(cfg->jnode, "sequenceNumber", &value))
+	/* If resetting seq to Zero, make sure cached value reset as well */
+	if (seq && get_int(cfg->jnode, "sequenceNumber", &value))
 		cached = (uint32_t)value;
 
 	/*
