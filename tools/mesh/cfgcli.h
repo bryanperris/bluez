@@ -18,9 +18,8 @@
  *
  */
 
-void keys_add_net_key(uint16_t net_idx);
-void keys_del_net_key(uint16_t net_idx);
-void keys_add_app_key(uint16_t net_idx, uint16_t app_idx);
-void keys_del_app_key(uint16_t app_idx);
-uint16_t keys_get_bound_key(uint16_t app_idx);
-void keys_print_keys(void);
+typedef bool (*key_send_func_t) (void *user_data, uint16_t dst,
+				 uint16_t idx, bool is_appkey, bool update);
+
+struct model_info *cfgcli_init(key_send_func_t key_func, void *user_data);
+void cfgcli_cleanup(void);
