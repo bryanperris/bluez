@@ -3506,8 +3506,8 @@ Read Advertisement Monitor Features Command
 	This command can be used when the controller is not powered.
 
 
-Add Advertisement Patterns Monitor Command
-==========================================
+Add Advertisement Monitor Command
+=================================
 
 	Command Code:		0x0052
 	Controller Index:	<controller id>
