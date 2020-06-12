@@ -10,15 +10,13 @@ fi
 	--mandir=/usr/share/man \
 	--sysconfdir=/etc \
 	--localstatedir=/var \
-    --enable-external-ell \
-    --with-package=ell \
+        --with-package=ell \
 	--enable-mesh \
 	--enable-debug \
 	--enable-experimental \
 	--enable-tools \
 	--enable-logger \
-	--disable-datafiles
-	--enable-library \
+	--disable-datafiles \
 	--enable-maintainer-mode
 
 make -j4
