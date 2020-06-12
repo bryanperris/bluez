@@ -36,6 +36,7 @@
 #include "mesh/mesh-config.h"
 #include "mesh/model.h"
 #include "mesh/appkey.h"
+#include "mesh/rpl.h"
 
 #define abs_diff(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 
@@ -53,14 +54,8 @@
 #define SEG_TO	2
 #define MSG_TO	60
 
-#define DEFAULT_MIN_DELAY		0
-#define DEFAULT_MAX_DELAY		25
-
 #define DEFAULT_TRANSMIT_COUNT		1
 #define DEFAULT_TRANSMIT_INTERVAL	100
-
-#define BEACON_INTERVAL_MIN	10
-#define BEACON_INTERVAL_MAX	600
 
 #define SAR_KEY(src, seq0)	((((uint32_t)(seq0)) << 16) | (src))
 
@@ -90,23 +85,12 @@ struct net_key {
 	uint8_t network_id[8];
 };
 
-struct mesh_beacon {
-	struct l_timeout *timeout;
-	uint32_t ts;
-	uint16_t observe_period;
-	uint16_t observed;
-	uint16_t expected;
-	uint8_t half_period;
-	uint8_t beacon[23];
-};
-
 struct mesh_subnet {
 	struct mesh_net *net;
 	uint16_t idx;
 	uint32_t net_key_tx;
 	uint32_t net_key_cur;
 	uint32_t net_key_upd;
-	struct mesh_beacon snb;
 	uint8_t key_refresh;
 	uint8_t kr_phase;
 };
@@ -124,7 +108,6 @@ struct mesh_net {
 	bool friend_enable;
 	bool beacon_enable;
 	bool proxy_enable;
-	bool provisioner;
 	bool friend_seq;
 	struct l_timeout *iv_update_timeout;
 	enum _iv_upd_state iv_upd_state;
@@ -135,13 +118,11 @@ struct mesh_net {
 	uint32_t seq_num;
 	uint16_t src_addr;
 	uint16_t last_addr;
-	uint16_t friend_addr;
 	uint16_t tx_interval;
 	uint16_t tx_cnt;
 	uint8_t chan; /* Channel of recent Rx */
 	uint8_t default_ttl;
 	uint8_t tid;
-	uint8_t window_accuracy;
 
 	struct {
 		bool enable;
@@ -153,26 +134,14 @@ struct mesh_net {
 
 	struct l_queue *subnets;
 	struct l_queue *msg_cache;
+	struct l_queue *replay_cache;
 	struct l_queue *sar_in;
 	struct l_queue *sar_out;
+	struct l_queue *sar_queue;
 	struct l_queue *frnd_msgs;
 	struct l_queue *friends;
+	struct l_queue *negotiations;
 	struct l_queue *destinations;
-
-	uint8_t prov_priv_key[32];
-
-	/* Unprovisioned Identity */
-	char id_name[20];
-	uint8_t id_uuid[16];
-
-	/* Provisioner: unicast address range */
-	struct mesh_net_addr_range prov_uni_addr;
-
-	/* Test Data */
-	uint8_t prov_rand[16];
-	uint8_t test_bd_addr[6];
-	struct mesh_net_prov_caps prov_caps;
-	bool test_mode;
 };
 
 struct mesh_msg {
@@ -185,18 +154,18 @@ struct mesh_sar {
 	unsigned int id;
 	struct l_timeout *seg_timeout;
 	struct l_timeout *msg_timeout;
-	mesh_net_status_func_t status_func;
-	void *user_data;
 	uint32_t flags;
 	uint32_t last_nak;
 	uint32_t iv_index;
 	uint32_t seqAuth;
 	uint16_t seqZero;
 	uint16_t app_idx;
+	uint16_t net_idx;
 	uint16_t src;
 	uint16_t remote;
 	uint16_t len;
 	bool szmic;
+	bool segmented;
 	bool frnd;
 	bool frnd_cred;
 	uint8_t ttl;
@@ -255,11 +224,21 @@ struct net_queue_data {
 	uint32_t key_id;
 	uint32_t iv_index;
 	uint16_t len;
+	bool seen;
+};
+
+struct oneshot_tx {
+	struct mesh_net *net;
+	uint8_t size;
+	uint8_t packet[30];
 };
 
 struct net_beacon_data {
-	const uint8_t *data;
-	uint16_t len;
+	uint32_t key_id;
+	uint32_t ivi;
+	bool ivu;
+	bool kr;
+	bool processed;
 };
 
 #define FAST_CACHE_SIZE 8
@@ -290,6 +269,15 @@ static bool match_key_id(const void *a, const void *b)
 					(key_id == subnet->net_key_upd);
 }
 
+static bool match_friend_key_id(const void *a, const void *b)
+{
+	const struct mesh_friend *friend = a;
+	uint32_t key_id = L_PTR_TO_UINT(b);
+
+	return (key_id == friend->net_key_cur) ||
+					(key_id == friend->net_key_upd);
+}
+
 static void idle_mesh_heartbeat_send(void *net)
 {
 	mesh_net_heartbeat_send(net);
@@ -300,7 +288,7 @@ static void trigger_heartbeat(struct mesh_net *net, uint16_t feature,
 {
 	struct mesh_net_heartbeat *hb = &net->heartbeat;
 
-	l_info("%s: %4.4x --> %d", __func__, feature, in_use);
+	l_debug("%s: %4.4x --> %d", __func__, feature, in_use);
 	if (in_use) {
 		if (net->heartbeat.features & feature)
 			return; /* no change */
@@ -325,7 +313,7 @@ static bool match_by_friend(const void *a, const void *b)
 	const struct mesh_friend *frnd = a;
 	uint16_t dst = L_PTR_TO_UINT(b);
 
-	return frnd->dst == dst;
+	return frnd->lp_addr == dst;
 }
 
 static void free_friend_internals(struct mesh_friend *frnd)
@@ -333,13 +321,15 @@ static void free_friend_internals(struct mesh_friend *frnd)
 	if (frnd->pkt_cache)
 		l_queue_destroy(frnd->pkt_cache, l_free);
 
-	if (frnd->grp_list)
-		l_free(frnd->grp_list);
-
+	l_free(frnd->u.active.grp_list);
+	frnd->u.active.grp_list = NULL;
 	frnd->pkt_cache = NULL;
-	frnd->grp_list = NULL;
+
 	net_key_unref(frnd->net_key_cur);
 	net_key_unref(frnd->net_key_upd);
+	frnd->net_key_cur = 0;
+	frnd->net_key_upd = 0;
+
 }
 
 static void frnd_kr_phase1(void *a, void *b)
@@ -347,7 +337,7 @@ static void frnd_kr_phase1(void *a, void *b)
 	struct mesh_friend *frnd = a;
 	uint32_t key_id = L_PTR_TO_UINT(b);
 
-	frnd->net_key_upd = net_key_frnd_add(key_id, frnd->dst,
+	frnd->net_key_upd = net_key_frnd_add(key_id, frnd->lp_addr,
 			frnd->net->src_addr, frnd->lp_cnt, frnd->fn_cnt);
 }
 
@@ -362,16 +352,16 @@ static void frnd_kr_phase2(void *a, void *b)
 	 * receives it's first Poll using the new keys (?)
 	 */
 
-	l_info("Use Both KeySet %d && %d for %4.4x",
-			frnd->net_key_cur, frnd->net_key_upd, frnd->dst);
+	l_debug("Use Both KeySet %d && %d for %4.4x",
+			frnd->net_key_cur, frnd->net_key_upd, frnd->lp_addr);
 }
 
 static void frnd_kr_phase3(void *a, void *b)
 {
 	struct mesh_friend *frnd = a;
 
-	l_info("Replace KeySet %d with %d for %4.4x",
-			frnd->net_key_cur, frnd->net_key_upd, frnd->dst);
+	l_debug("Replace KeySet %d with %d for %4.4x",
+			frnd->net_key_cur, frnd->net_key_upd, frnd->lp_addr);
 	net_key_unref(frnd->net_key_cur);
 	frnd->net_key_cur = frnd->net_key_upd;
 	frnd->net_key_upd = 0;
@@ -399,7 +389,7 @@ struct mesh_friend *mesh_friend_new(struct mesh_net *net, uint16_t dst,
 
 	/* add _k2 */
 	frnd->net = net;
-	frnd->dst = dst;
+	frnd->lp_addr = dst;
 	frnd->frd = frd;
 	frnd->frw = frw;
 	frnd->fn_cnt = fn_cnt;
@@ -419,6 +409,7 @@ struct mesh_friend *mesh_friend_new(struct mesh_net *net, uint16_t dst,
 	if (!subnet->net_key_upd)
 		return frnd;
 
+	frnd->net_idx = subnet->idx;
 	frnd->net_key_upd = net_key_frnd_add(subnet->net_key_upd,
 							dst, net->src_addr,
 							lp_cnt, fn_cnt);
@@ -456,17 +447,20 @@ void mesh_friend_sub_add(struct mesh_net *net, uint16_t lpn, uint8_t ele_cnt,
 	if (!frnd)
 		return;
 
-	new_list = l_malloc((grp_cnt + frnd->grp_cnt) * sizeof(uint16_t));
-	grp_list = frnd->grp_list;
+	new_list = l_malloc((grp_cnt +
+				frnd->u.active.grp_cnt) * sizeof(uint16_t));
+	grp_list = frnd->u.active.grp_list;
 
-	if (grp_list && frnd->grp_cnt)
-		memcpy(new_list, grp_list, frnd->grp_cnt * sizeof(uint16_t));
+	if (grp_list && frnd->u.active.grp_cnt)
+		memcpy(new_list, grp_list,
+				frnd->u.active.grp_cnt * sizeof(uint16_t));
 
-	memcpy(&new_list[frnd->grp_cnt], list, grp_cnt * sizeof(uint16_t));
+	memcpy(&new_list[frnd->u.active.grp_cnt], list,
+						grp_cnt * sizeof(uint16_t));
 	l_free(grp_list);
 	frnd->ele_cnt = ele_cnt;
-	frnd->grp_list = new_list;
-	frnd->grp_cnt += grp_cnt;
+	frnd->u.active.grp_list = new_list;
+	frnd->u.active.grp_cnt += grp_cnt;
 }
 
 void mesh_friend_sub_del(struct mesh_net *net, uint16_t lpn,
@@ -482,8 +476,8 @@ void mesh_friend_sub_del(struct mesh_net *net, uint16_t lpn,
 	if (!frnd)
 		return;
 
-	grp_cnt = frnd->grp_cnt;
-	grp_list = frnd->grp_list;
+	grp_cnt = frnd->u.active.grp_cnt;
+	grp_list = frnd->u.active.grp_list;
 
 	while (cnt-- && grp_cnt) {
 		cnt16 -= sizeof(uint16_t);
@@ -497,17 +491,27 @@ void mesh_friend_sub_del(struct mesh_net *net, uint16_t lpn,
 		}
 	}
 
-	frnd->grp_cnt = grp_cnt;
+	frnd->u.active.grp_cnt = grp_cnt;
 
 	if (!grp_cnt) {
-		l_free(frnd->grp_list);
-		frnd->grp_list = NULL;
+		l_free(frnd->u.active.grp_list);
+		frnd->u.active.grp_list = NULL;
 	}
 }
 
 uint32_t mesh_net_next_seq_num(struct mesh_net *net)
 {
 	uint32_t seq = net->seq_num++;
+
+	/*
+	 * Cap out-of-range seq_num max value to +1. Out of range
+	 * seq_nums will not be sent as they would violate spec.
+	 * This condition signals a runaway seq_num condition, and
+	 * the node must wait for a completed IV Index update procedure
+	 * before it can send again.
+	 */
+	if (net->seq_num > SEQ_MASK)
+		net->seq_num = SEQ_MASK + 1;
 
 	node_set_sequence_number(net->node, net->seq_num);
 	return seq;
@@ -519,9 +523,7 @@ static struct mesh_sar *mesh_sar_new(size_t len)
 	struct mesh_sar *sar;
 
 	sar = l_malloc(size);
-
 	memset(sar, 0, size);
-
 	return sar;
 }
 
@@ -537,13 +539,6 @@ static void mesh_sar_free(void *data)
 	l_free(sar);
 }
 
-static void mesh_msg_free(void *data)
-{
-	struct mesh_msg *msg = data;
-
-	l_free(msg);
-}
-
 static void subnet_free(void *data)
 {
 	struct mesh_subnet *subnet = data;
@@ -552,9 +547,6 @@ static void subnet_free(void *data)
 	net_key_unref(subnet->net_key_upd);
 	l_free(subnet);
 }
-
-static void lpn_process_beacon(void *user_data, const void *data, uint8_t size,
-								int8_t rssi);
 
 static struct mesh_subnet *subnet_new(struct mesh_net *net, uint16_t idx)
 {
@@ -566,93 +558,67 @@ static struct mesh_subnet *subnet_new(struct mesh_net *net, uint16_t idx)
 
 	subnet->net = net;
 	subnet->idx = idx;
-	subnet->snb.beacon[0] = MESH_AD_TYPE_BEACON;
 	return subnet;
 }
 
-static bool create_secure_beacon(struct mesh_net *net,
-					struct mesh_subnet *subnet,
-					uint8_t *beacon_data)
-{
-	bool kr = (subnet->kr_phase == KEY_REFRESH_PHASE_TWO);
-
-	return net_key_snb_compose(subnet->net_key_tx, net->iv_index,
-					kr, net->iv_update, beacon_data);
-}
-
-static void send_network_beacon(struct mesh_subnet *subnet,
-							struct mesh_net *net)
-{
-	struct mesh_io_send_info info = {
-		.type = MESH_IO_TIMING_TYPE_GENERAL,
-		.u.gen.interval = net->tx_interval,
-		.u.gen.cnt = 1,
-		.u.gen.min_delay = DEFAULT_MIN_DELAY,
-		.u.gen.max_delay = DEFAULT_MAX_DELAY
-	};
-
-	l_info("Send SNB on network %3.3x", subnet->idx);
-	mesh_io_send(net->io, &info, subnet->snb.beacon,
-						sizeof(subnet->snb.beacon));
-}
-
-static void network_beacon_timeout(struct l_timeout *timeout, void *user_data)
-{
-	struct mesh_subnet *subnet = user_data;
-	uint32_t interval;
-
-	send_network_beacon(subnet, subnet->net);
-
-	if (!subnet->snb.half_period) {
-		l_debug("beacon TO period %d, observed %d, expected %d",
-						subnet->snb.observe_period,
-						subnet->snb.observed,
-						subnet->snb.expected);
-		interval = subnet->snb.observe_period *
-			(subnet->snb.observed + 1) / subnet->snb.expected;
-		subnet->snb.observe_period = interval * 2;
-		subnet->snb.expected = subnet->snb.observe_period / 10;
-		subnet->snb.observed = 0;
-	} else
-		interval = subnet->snb.observe_period / 2;
-
-	if (interval < BEACON_INTERVAL_MIN)
-		interval = BEACON_INTERVAL_MIN;
-
-	if (interval > BEACON_INTERVAL_MAX)
-		interval = BEACON_INTERVAL_MAX;
-
-	subnet->snb.ts = get_timestamp_secs();
-	subnet->snb.half_period ^= 1;
-	l_timeout_modify(timeout, interval);
-}
-
-static void start_network_beacon(void *a, void *b)
+static void enable_beacon(void *a, void *b)
 {
 	struct mesh_subnet *subnet = a;
 	struct mesh_net *net = b;
 
-	if (!net->beacon_enable) {
-		if (subnet->snb.timeout)
-			l_timeout_remove(subnet->snb.timeout);
-		subnet->snb.timeout = NULL;
-		return;
+	if (net->beacon_enable)
+		net_key_beacon_enable(subnet->net_key_tx);
+	else
+		net_key_beacon_disable(subnet->net_key_tx);
+}
+
+static void enqueue_update(void *a, void *b);
+
+static void queue_friend_update(struct mesh_net *net)
+{
+	struct mesh_subnet *subnet;
+	struct mesh_friend *frnd;
+	uint8_t flags = 0;
+
+	if (l_queue_length(net->friends)) {
+		struct mesh_friend_msg update = {
+			.src = net->src_addr,
+			.iv_index = mesh_net_get_iv_index(net),
+			.last_len = 7,
+			.ctl = true,
+		};
+
+		frnd = l_queue_peek_head(net->friends);
+		subnet = l_queue_find(net->subnets, match_key_index,
+						L_UINT_TO_PTR(frnd->net_idx));
+
+		if (!subnet)
+			return;
+
+		if (subnet->kr_phase == KEY_REFRESH_PHASE_TWO)
+			flags |= KEY_REFRESH;
+
+		if (net->iv_update)
+			flags |= IV_INDEX_UPDATE;
+
+		update.u.one[0].hdr = NET_OP_FRND_UPDATE << OPCODE_HDR_SHIFT;
+		update.u.one[0].seq = mesh_net_next_seq_num(net);
+		update.u.one[0].data[0] = NET_OP_FRND_UPDATE;
+		update.u.one[0].data[1] = flags;
+		l_put_be32(net->iv_index, update.u.one[0].data + 2);
+		update.u.one[0].data[6] = 0x01; /* More Data */
+
+		l_queue_foreach(net->friends, enqueue_update, &update);
 	}
+}
 
-	/* If timeout is active, let it run it's course */
-	if (subnet->snb.timeout)
-		return;
+static void refresh_beacon(void *a, void *b)
+{
+	struct mesh_subnet *subnet = a;
+	struct mesh_net *net = b;
 
-	send_network_beacon(subnet, subnet->net);
-
-	subnet->snb.ts = get_timestamp_secs();
-	subnet->snb.expected = 2;
-	subnet->snb.observed = 0;
-	subnet->snb.half_period = 1;
-	subnet->snb.observe_period = BEACON_INTERVAL_MIN * 2;
-
-	subnet->snb.timeout = l_timeout_create(BEACON_INTERVAL_MIN,
-				network_beacon_timeout, subnet, NULL);
+	net_key_beacon_refresh(subnet->net_key_tx, net->iv_index,
+		!!(subnet->kr_phase == KEY_REFRESH_PHASE_TWO), net->iv_update);
 }
 
 struct mesh_net *mesh_net_new(struct mesh_node *node)
@@ -662,22 +628,8 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
 	net = l_new(struct mesh_net, 1);
 
 	net->node = node;
-	net->pkt_id = 0;
-	net->bea_id = 0;
-
-	net->beacon_enable = true;
-	net->proxy_enable = false;
-	net->relay.enable = false;
-
-	net->seq_num = 0x000000;
-	net->src_addr = 0x0000;
-	net->default_ttl = 0x7f;
-
-	net->provisioner = false;
-
-	net->test_mode = false;
-	memset(&net->prov_caps, 0, sizeof(net->prov_caps));
-	net->prov_caps.algorithms = 1;
+	net->seq_num = DEFAULT_SEQUENCE_NUMBER;
+	net->default_ttl = TTL_MASK;
 
 	net->tx_cnt = DEFAULT_TRANSMIT_COUNT;
 	net->tx_interval = DEFAULT_TRANSMIT_INTERVAL;
@@ -686,8 +638,8 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
 	net->msg_cache = l_queue_new();
 	net->sar_in = l_queue_new();
 	net->sar_out = l_queue_new();
+	net->sar_queue = l_queue_new();
 	net->frnd_msgs = l_queue_new();
-	net->friends = l_queue_new();
 	net->destinations = l_queue_new();
 	net->app_keys = l_queue_new();
 
@@ -702,21 +654,34 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
 	return net;
 }
 
-void mesh_net_free(struct mesh_net *net)
+void mesh_net_free(void *user_data)
 {
+	struct mesh_net *net = user_data;
+
 	if (!net)
 		return;
 
 	l_queue_destroy(net->subnets, subnet_free);
-	l_queue_destroy(net->msg_cache, mesh_msg_free);
+	l_queue_destroy(net->msg_cache, l_free);
+	l_queue_destroy(net->replay_cache, l_free);
 	l_queue_destroy(net->sar_in, mesh_sar_free);
 	l_queue_destroy(net->sar_out, mesh_sar_free);
+	l_queue_destroy(net->sar_queue, mesh_sar_free);
 	l_queue_destroy(net->frnd_msgs, l_free);
 	l_queue_destroy(net->friends, mesh_friend_free);
+	l_queue_destroy(net->negotiations, mesh_friend_free);
 	l_queue_destroy(net->destinations, l_free);
 	l_queue_destroy(net->app_keys, appkey_key_free);
 
 	l_free(net);
+}
+
+void mesh_net_cleanup(void)
+{
+	l_queue_destroy(fast_cache, l_free);
+	fast_cache = NULL;
+	l_queue_destroy(nets, mesh_net_free);
+	nets = NULL;
 }
 
 bool mesh_net_set_seq_num(struct mesh_net *net, uint32_t seq)
@@ -809,11 +774,22 @@ bool mesh_net_set_proxy_mode(struct mesh_net *net, bool enable)
 
 bool mesh_net_set_friend_mode(struct mesh_net *net, bool enable)
 {
+	l_debug("mesh_net_set_friend_mode - %d", enable);
+
 	if (!net)
 		return false;
 
-	if (net->friend_enable && !enable)
-		l_queue_clear(net->friends, mesh_friend_free);
+	if (net->friend_enable == enable)
+		return true;
+
+	if (enable) {
+		net->friends = l_queue_new();
+		net->negotiations = l_queue_new();
+	} else {
+		l_queue_destroy(net->friends, mesh_friend_free);
+		l_queue_destroy(net->negotiations, mesh_friend_free);
+		net->friends = net->negotiations = NULL;
+	}
 
 	net->friend_enable = enable;
 	trigger_heartbeat(net, FEATURE_FRIEND, enable);
@@ -831,93 +807,6 @@ bool mesh_net_set_relay_mode(struct mesh_net *net, bool enable,
 	net->relay.interval = interval;
 	trigger_heartbeat(net, FEATURE_RELAY, enable);
 	return true;
-}
-
-struct mesh_net_prov_caps *mesh_net_prov_caps_get(struct mesh_net *net)
-{
-	if (net)
-		return &net->prov_caps;
-
-	return NULL;
-}
-
-char *mesh_net_id_name(struct mesh_net *net)
-{
-	if (net && net->id_name[0])
-		return net->id_name;
-
-	return NULL;
-}
-
-bool mesh_net_id_uuid_set(struct mesh_net *net, uint8_t uuid[16])
-{
-	if (!net)
-		return false;
-
-	memcpy(net->id_uuid, uuid, 16);
-
-	return true;
-}
-
-uint8_t *mesh_net_priv_key_get(struct mesh_net *net)
-{
-	if (net)
-		return net->prov_priv_key;
-
-	return NULL;
-}
-
-bool mesh_net_priv_key_set(struct mesh_net *net, uint8_t key[32])
-{
-	if (!net)
-		return false;
-
-	memcpy(net->prov_priv_key, key, 32);
-	return true;
-}
-
-uint8_t *mesh_net_test_addr(struct mesh_net *net)
-{
-	const uint8_t zero_addr[] = {0, 0, 0, 0, 0, 0};
-
-	if (net && memcmp(net->test_bd_addr, zero_addr, 6))
-		return net->test_bd_addr;
-
-	return NULL;
-}
-
-uint8_t *mesh_net_prov_rand(struct mesh_net *net)
-{
-	if (net)
-		return net->prov_rand;
-
-	return NULL;
-}
-
-uint16_t mesh_net_prov_uni(struct mesh_net *net, uint8_t ele_cnt)
-{
-	uint16_t uni;
-	uint16_t next;
-
-	if (!net)
-		return 0;
-
-	next = net->prov_uni_addr.next + ele_cnt;
-	if (next > 0x8000 || next > net->prov_uni_addr.high)
-		return UNASSIGNED_ADDRESS;
-
-	uni = net->prov_uni_addr.next;
-	net->prov_uni_addr.next = next;
-
-	return uni;
-}
-
-bool mesh_net_test_mode(struct mesh_net *net)
-{
-	if (net)
-		return net->test_mode;
-
-	return false;
 }
 
 int mesh_net_get_identity_mode(struct mesh_net *net, uint16_t idx,
@@ -953,7 +842,7 @@ int mesh_net_del_key(struct mesh_net *net, uint16_t idx)
 	subnet = l_queue_find(net->subnets, match_key_index,
 							L_UINT_TO_PTR(idx));
 	if (!subnet)
-		return MESH_STATUS_CANNOT_REMOVE;
+		return MESH_STATUS_SUCCESS;
 
 	/* Delete associated app keys */
 	appkey_delete_bound_keys(net, idx);
@@ -988,10 +877,11 @@ static struct mesh_subnet *add_key(struct mesh_net *net, uint16_t idx,
 		return NULL;
 	}
 
-	if (!create_secure_beacon(net, subnet, subnet->snb.beacon + 1)) {
-		subnet_free(subnet);
-		return NULL;
-	}
+	net_key_beacon_refresh(subnet->net_key_tx, net->iv_index,
+						false, net->iv_update);
+
+	if (net->beacon_enable)
+		net_key_beacon_enable(subnet->net_key_tx);
 
 	l_queue_push_tail(net->subnets, subnet);
 
@@ -1026,15 +916,7 @@ int mesh_net_add_key(struct mesh_net *net, uint16_t idx, const uint8_t *value)
 		return MESH_STATUS_STORAGE_FAIL;
 	}
 
-	if (net->io)
-		start_network_beacon(subnet, net);
-
 	return MESH_STATUS_SUCCESS;
-}
-
-void mesh_net_flush_msg_queues(struct mesh_net *net)
-{
-	l_queue_clear(net->msg_cache, mesh_msg_free);
 }
 
 uint32_t mesh_net_get_iv_index(struct mesh_net *net)
@@ -1055,11 +937,11 @@ void mesh_net_get_snb_state(struct mesh_net *net, uint8_t *flags,
 		return;
 
 	*iv_index = net->iv_index;
-	*flags = (net->iv_upd_state == IV_UPD_UPDATING) ? 0x02 : 0x00;
+	*flags = net->iv_update ? IV_INDEX_UPDATE : 0x00;
 
 	subnet = get_primary_subnet(net);
 	if (subnet)
-		*flags |= subnet->key_refresh ? 0x01 : 0x00;
+		*flags |= subnet->key_refresh ? KEY_REFRESH : 0x00;
 }
 
 bool mesh_net_get_key(struct mesh_net *net, bool new_key, uint16_t idx,
@@ -1090,26 +972,46 @@ bool mesh_net_get_key(struct mesh_net *net, bool new_key, uint16_t idx,
 bool mesh_net_key_list_get(struct mesh_net *net, uint8_t *buf, uint16_t *size)
 {
 	const struct l_queue_entry *entry;
-	uint16_t n, buf_size;
+	uint16_t num_keys, req_size, buf_size;
+	struct mesh_subnet *subnet;
 
 	if (!net || !buf || !size)
 		return false;
 
 	buf_size = *size;
-	if (buf_size < l_queue_length(net->subnets) * 2)
+
+	num_keys = l_queue_length(net->subnets);
+	req_size = (num_keys / 2) * 3 + (num_keys % 2) * 2;
+
+	if (buf_size < req_size)
 		return false;
 
-	n = 0;
-	entry = l_queue_get_entries(net->subnets);
+	*size = req_size;
 
-	for (; entry; entry = entry->next) {
-		struct mesh_subnet *subnet = entry->data;
+	/* Pack NetKey indices in 3 octets */
+	for (entry = l_queue_get_entries(net->subnets); num_keys > 1;) {
+		uint32_t idx_pair;
 
-		l_put_le16(subnet->idx, buf);
-		n += 2;
+		subnet = entry->data;
+		idx_pair = subnet->idx;
+		idx_pair <<= 12;
+
+		subnet = entry->next->data;
+		idx_pair += subnet->idx;
+
+		l_put_le32(idx_pair, buf);
+		buf += 3;
+
+		num_keys -= 2;
+		entry = entry->next->next;
 	}
 
-	*size = n;
+	/* If odd number of NetKeys, fill in the end of the buffer */
+	if (num_keys % 2) {
+		subnet = entry->data;
+		l_put_le16(subnet->idx, buf);
+	}
+
 	return true;
 }
 
@@ -1221,14 +1123,14 @@ static bool match_frnd_dst(const void *a, const void *b)
 {
 	const struct mesh_friend *frnd = a;
 	uint16_t dst = L_PTR_TO_UINT(b);
-	int16_t i, grp_cnt = frnd->grp_cnt;
-	uint16_t *grp_list = frnd->grp_list;
+	int16_t i, grp_cnt = frnd->u.active.grp_cnt;
+	uint16_t *grp_list = frnd->u.active.grp_list;
 
 	/*
 	 * Determine if this message is for this friends unicast
 	 * address, and/or one of it's group/virtual addresses
 	 */
-	if (dst >= frnd->dst && dst < (frnd->dst + frnd->ele_cnt))
+	if (dst >= frnd->lp_addr && dst < (frnd->lp_addr + frnd->ele_cnt))
 		return true;
 
 	if (!(dst & 0x8000))
@@ -1242,12 +1144,9 @@ static bool match_frnd_dst(const void *a, const void *b)
 	return false;
 }
 
-static bool is_lpn_friend(struct mesh_net *net, uint16_t addr, bool frnd)
+static bool is_lpn_friend(struct mesh_net *net, uint16_t addr)
 {
 	void *tst;
-
-	if (!frnd)
-		return false;
 
 	tst = l_queue_find(net->friends, match_frnd_dst, L_UINT_TO_PTR(addr));
 
@@ -1333,7 +1232,8 @@ static void enqueue_friend_pkt(void *a, void *b)
 	 * Determine if this message is for this friends unicast
 	 * address, and/or one of it's group/virtual addresses
 	 */
-	if (rx->dst >= frnd->dst && (rx->dst - frnd->dst) < frnd->ele_cnt) {
+	if (rx->dst >= frnd->lp_addr && (rx->dst - frnd->lp_addr) <
+							frnd->ele_cnt) {
 		rx->done = true;
 		goto enqueue;
 	}
@@ -1342,8 +1242,8 @@ static void enqueue_friend_pkt(void *a, void *b)
 		return;
 
 	if (!IS_ALL_NODES(rx->dst)) {
-		for (i = 0; i < frnd->grp_cnt; i++) {
-			if (rx->dst == frnd->grp_list[i])
+		for (i = 0; i < frnd->u.active.grp_cnt; i++) {
+			if (rx->dst == frnd->u.active.grp_list[i])
 				goto enqueue;
 		}
 		return;
@@ -1359,24 +1259,23 @@ enqueue:
 			void *old = l_queue_remove_if(frnd->pkt_cache,
 							match_ack, rx);
 
-			if (old) {
-				if (old_head == old) {
-					/*
-					 * If we are discarding head for any
-					 * reason, reset FRND SEQ
-					 */
-					frnd->last = frnd->seq;
-				}
-
-				l_free(old);
-			} else
+			if (!old)
 				break;
+
+			if (old_head == old)
+				/*
+				 * If we are discarding head for any
+				 * reason, reset FRND SEQ
+				 */
+				frnd->u.active.last = frnd->u.active.seq;
+
+			l_free(old);
 
 		} while (true);
 	}
 
 	l_debug("%s for %4.4x from %4.4x ttl: %2.2x (seq: %6.6x) (ctl: %d)",
-			__func__, frnd->dst, rx->src, rx->ttl,
+			__func__, frnd->lp_addr, rx->src, rx->ttl,
 			rx->u.one[0].seq, rx->ctl);
 
 	if (rx->cnt_in) {
@@ -1398,7 +1297,7 @@ enqueue:
 		 */
 		pkt = l_queue_pop_head(frnd->pkt_cache);
 		l_free(pkt);
-		frnd->last = frnd->seq;
+		frnd->u.active.last = frnd->u.active.seq;
 	}
 }
 
@@ -1407,7 +1306,7 @@ static void enqueue_update(void *a, void *b)
 	struct mesh_friend *frnd = a;
 	struct mesh_friend_msg *pkt = b;
 
-	pkt->dst = frnd->dst;
+	pkt->dst = frnd->lp_addr;
 	pkt->done = false;
 	enqueue_friend_pkt(frnd, pkt);
 }
@@ -1451,6 +1350,7 @@ static bool friend_packet_queue(struct mesh_net *net,
 			data += 12;
 			hdr += (1 << SEGO_HDR_SHIFT);
 		}
+
 		frnd_msg->u.s12[seg_max].seq = seq;
 		frnd_msg->cnt_in = seg_max;
 		frnd_msg->last_len = size % 12;
@@ -1474,6 +1374,7 @@ static bool friend_packet_queue(struct mesh_net *net,
 			memcpy(frnd_msg->u.one[0].data, data, size);
 			frnd_msg->last_len = size;
 		}
+
 		frnd_msg->u.one[0].hdr = hdr;
 		frnd_msg->u.one[0].seq = seq;
 	}
@@ -1550,14 +1451,14 @@ static void send_frnd_ack(struct mesh_net *net, uint16_t src, uint16_t dst,
 	l_put_be32(hdr, msg);
 	l_put_be32(flags, msg + 3);
 
-	l_info("Send Friend ACK to Segs: %8.8x", flags);
+	l_debug("Send Friend ACK to Segs: %8.8x", flags);
 
-	if (is_lpn_friend(net, dst, true)) {
+	if (is_lpn_friend(net, dst)) {
 		/* If we are acking our LPN Friend, queue, don't send */
 		friend_ack_rxed(net, mesh_net_get_iv_index(net),
 				mesh_net_next_seq_num(net), 0, dst, msg);
 	} else {
-		mesh_net_transport_send(net, 0, false,
+		mesh_net_transport_send(net, 0, 0,
 				mesh_net_get_iv_index(net), DEFAULT_TTL,
 				0, 0, dst, msg, sizeof(msg));
 	}
@@ -1575,30 +1476,27 @@ static void send_net_ack(struct mesh_net *net, struct mesh_sar *sar,
 	if (src & 0x8000)
 		return;
 
-	/* We don't ACK segments as a Low Power Node */
-	if (net->friend_addr)
-		return;
-
 	hdr = NET_OP_SEG_ACKNOWLEDGE << OPCODE_HDR_SHIFT;
 	hdr |= sar->seqZero << SEQ_ZERO_HDR_SHIFT;
 
-	if (is_lpn_friend(net, src, true))
+	if (is_lpn_friend(net, src))
 		hdr |= true << RELAY_HDR_SHIFT;
 
 	l_put_be32(hdr, msg);
 	l_put_be32(flags, msg + 3);
-	l_info("Send%s ACK to Segs: %8.8x", sar->frnd ? " Friend" : "", flags);
+	l_debug("Send%s ACK to Segs: %8.8x", sar->frnd ? " Friend" : "", flags);
 
-	if (is_lpn_friend(net, dst, true)) {
+	if (is_lpn_friend(net, dst)) {
 		/* If we are acking our LPN Friend, queue, don't send */
 		friend_ack_rxed(net, mesh_net_get_iv_index(net),
 				mesh_net_next_seq_num(net), src, dst, msg);
 		return;
 	}
 
-	mesh_net_transport_send(net, 0, false,
+	mesh_net_transport_send(net, 0, sar->net_idx,
 				mesh_net_get_iv_index(net), DEFAULT_TTL,
-				0, src, dst, msg, sizeof(msg));
+				0, src, dst, msg,
+				sizeof(msg));
 }
 
 static void inseg_to(struct l_timeout *seg_timeout, void *user_data)
@@ -1612,7 +1510,7 @@ static void inseg_to(struct l_timeout *seg_timeout, void *user_data)
 		return;
 
 	/* Send NAK */
-	l_info("Timeout %p %3.3x", sar, sar->app_idx);
+	l_debug("Timeout %p %3.3x", sar, sar->app_idx);
 	send_net_ack(net, sar, sar->flags);
 
 	sar->seg_timeout = l_timeout_create(SEG_TO, inseg_to, net, NULL);
@@ -1629,8 +1527,6 @@ static void inmsg_to(struct l_timeout *msg_timeout, void *user_data)
 		return;
 
 	sar->msg_timeout = NULL;
-
-	/* print_packet("Incoming SAR Timeout", sar->buf, sar->len); */
 	mesh_sar_free(sar);
 }
 
@@ -1645,17 +1541,26 @@ static void outmsg_to(struct l_timeout *msg_timeout, void *user_data)
 		return;
 
 	sar->msg_timeout = NULL;
-
-	if (sar->status_func)
-		sar->status_func(sar->remote, 1,
-				sar->buf, sar->len - 4,
-				sar->user_data);
-
-	/* print_packet("Outgoing SAR Timeout", sar->buf, sar->len); */
 	mesh_sar_free(sar);
 }
 
 static void outseg_to(struct l_timeout *seg_timeout, void *user_data);
+
+static void send_queued_sar(struct mesh_net *net, uint16_t dst)
+{
+	struct mesh_sar *sar = l_queue_remove_if(net->sar_queue,
+			match_sar_remote, L_UINT_TO_PTR(dst));
+
+	if (!sar)
+		return;
+
+	/* Out to current outgoing, and immediate expire Seg TO */
+	l_queue_push_head(net->sar_out, sar);
+	sar->seg_timeout = NULL;
+	sar->msg_timeout = l_timeout_create(MSG_TO, outmsg_to, net, NULL);
+	outseg_to(NULL, net);
+}
+
 static void ack_received(struct mesh_net *net, bool timeout,
 				uint16_t src, uint16_t dst,
 				uint16_t seq0, uint32_t ack_flag)
@@ -1665,13 +1570,13 @@ static void ack_received(struct mesh_net *net, bool timeout,
 	uint32_t ack_copy = ack_flag;
 	uint16_t i;
 
-	l_info("ACK Rxed (%x) (to:%d): %8.8x", seq0, timeout, ack_flag);
+	l_debug("ACK Rxed (%x) (to:%d): %8.8x", seq0, timeout, ack_flag);
 
 	outgoing = l_queue_find(net->sar_out, match_sar_seq0,
 							L_UINT_TO_PTR(seq0));
 
 	if (!outgoing) {
-		l_info("Not Found: %4.4x", seq0);
+		l_debug("Not Found: %4.4x", seq0);
 		return;
 	}
 
@@ -1685,12 +1590,9 @@ static void ack_received(struct mesh_net *net, bool timeout,
 		l_debug("ob_sar_removal (%x)", outgoing->flags);
 
 		/* Note: ack_flags == 0x00000000 is a remote Cancel request */
-		if (outgoing->status_func)
-			outgoing->status_func(src, ack_flag ? 0 : 1,
-					outgoing->buf,
-					outgoing->len - 4, outgoing->user_data);
 
 		l_queue_remove(net->sar_out, outgoing);
+		send_queued_sar(net, outgoing->remote);
 		mesh_sar_free(outgoing);
 
 		return;
@@ -1700,16 +1602,16 @@ static void ack_received(struct mesh_net *net, bool timeout,
 
 	ack_copy &= outgoing->flags;
 
-	for (i = 0; i <= SEG_MAX(outgoing->len); i++, seg_flag <<= 1) {
+	for (i = 0; i <= SEG_MAX(true, outgoing->len); i++, seg_flag <<= 1) {
 		if (seg_flag & ack_flag) {
 			l_debug("Skipping Seg %d of %d",
-					i, SEG_MAX(outgoing->len));
+					i, SEG_MAX(true, outgoing->len));
 			continue;
 		}
 
 		ack_copy |= seg_flag;
 
-		l_info("Resend Seg %d net:%p dst:%x app_idx:%3.3x",
+		l_debug("Resend Seg %d net:%p dst:%x app_idx:%3.3x",
 				i, net, outgoing->remote, outgoing->app_idx);
 
 		send_seg(net, outgoing, i);
@@ -1717,23 +1619,6 @@ static void ack_received(struct mesh_net *net, bool timeout,
 
 	l_timeout_remove(outgoing->seg_timeout);
 	outgoing->seg_timeout = l_timeout_create(SEG_TO, outseg_to, net, NULL);
-}
-
-static void outack_to(struct l_timeout *seg_timeout, void *user_data)
-{
-	struct mesh_net *net = user_data;
-	struct mesh_sar *sar = l_queue_find(net->sar_out,
-					match_seg_timeout, seg_timeout);
-
-	l_timeout_remove(seg_timeout);
-	if (!sar)
-		return;
-
-	sar->seg_timeout = NULL;
-
-	/* Re-Send missing segments by faking NAK */
-	ack_received(net, true, sar->remote, sar->src,
-				sar->seqZero, sar->last_nak);
 }
 
 static void outseg_to(struct l_timeout *seg_timeout, void *user_data)
@@ -1748,23 +1633,16 @@ static void outseg_to(struct l_timeout *seg_timeout, void *user_data)
 
 	sar->seg_timeout = NULL;
 
-	if (net->friend_addr) {
-		/* We are LPN -- Poll for ACK */
-		frnd_ack_poll(net);
-		sar->seg_timeout = l_timeout_create(SEG_TO,
-				outack_to, net, NULL);
-	} else {
-		/* Re-Send missing segments by faking NACK */
-		ack_received(net, true, sar->remote, sar->src,
+	/* Re-Send missing segments by faking NACK */
+	ack_received(net, true, sar->remote, sar->src,
 					sar->seqZero, sar->last_nak);
-	}
 }
 
 static bool msg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 					uint8_t ttl, uint32_t seq,
 					uint16_t net_idx,
 					uint16_t src, uint16_t dst,
-					uint8_t key_aid,
+					uint8_t key_aid, bool segmented,
 					bool szmic, uint16_t seqZero,
 					const uint8_t *data, uint16_t size)
 {
@@ -1791,7 +1669,7 @@ static bool msg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			hdr |= true << SEG_HDR_SHIFT;
 			hdr |= szmic << SZMIC_HDR_SHIFT;
 			hdr |= (seqZero & SEQ_ZERO_MASK) << SEQ_ZERO_HDR_SHIFT;
-			hdr |= SEG_MAX(size) << SEGN_HDR_SHIFT;
+			hdr |= SEG_MAX(true, size) << SEGN_HDR_SHIFT;
 		}
 
 		if (friend_packet_queue(net, iv_index, false, frnd_ttl,
@@ -1801,8 +1679,37 @@ static bool msg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 	}
 
 not_for_friend:
-	return mesh_model_rx(net->node, szmic, seqAuth, seq, iv_index, ttl,
-					net_idx, src, dst, key_aid, data, size);
+	return mesh_model_rx(net->node, szmic, seqAuth, seq, iv_index, net_idx,
+						src, dst, key_aid, data, size);
+}
+
+static uint16_t key_id_to_net_idx(struct mesh_net *net, uint32_t key_id)
+{
+	struct mesh_subnet *subnet;
+	struct mesh_friend *friend;
+
+	if (!net)
+		return NET_IDX_INVALID;
+
+	subnet = l_queue_find(net->subnets, match_key_id,
+						L_UINT_TO_PTR(key_id));
+
+	if (subnet)
+		return subnet->idx;
+
+	friend = l_queue_find(net->friends, match_friend_key_id,
+						L_UINT_TO_PTR(key_id));
+
+	if (friend)
+		return friend->net_idx;
+
+	friend = l_queue_find(net->negotiations, match_friend_key_id,
+						L_UINT_TO_PTR(key_id));
+
+	if (friend)
+		return friend->net_idx;
+	else
+		return NET_IDX_INVALID;
 }
 
 static bool match_frnd_sar_dst(const void *a, const void *b)
@@ -1834,9 +1741,10 @@ static void friend_seg_rxed(struct mesh_net *net,
 	if (!frnd)
 		return;
 
-	if (frnd->last_hdr == hdr_key) {
+	if (frnd->u.active.last_hdr == hdr_key) {
 		/* We are no longer receiving this msg. Resend final ACK */
-		send_frnd_ack(net, dst, src, frnd->last_hdr, 0xffffffff);
+		send_frnd_ack(net, dst, src, frnd->u.active.last_hdr,
+								0xffffffff);
 		return;
 	}
 
@@ -1878,12 +1786,12 @@ static void friend_seg_rxed(struct mesh_net *net,
 	if (segN == segO)
 		frnd_msg->last_len = size;
 
-	l_info("RXed Seg %d, Flags %8.8x (cnt: %d)",
+	l_debug("RXed Seg %d, Flags %8.8x (cnt: %d)",
 						segO, frnd_msg->flags, cnt);
 
 	/* In reality, if one of these is true, then *both* must be true */
 	if ((cnt == segN) || (frnd_msg->flags == expected)) {
-		l_info("Full ACK");
+		l_debug("Full ACK");
 		send_frnd_ack(net, dst, src, hdr, frnd_msg->flags);
 
 		if (frnd_msg->ttl > 1) {
@@ -1903,7 +1811,7 @@ static void friend_seg_rxed(struct mesh_net *net,
 
 	/* Always ACK if this is the largest outstanding segment */
 	if ((largest & frnd_msg->flags) == largest) {
-		l_info("Partial ACK");
+		l_debug("Partial ACK");
 		send_frnd_ack(net, dst, src, hdr, frnd_msg->flags);
 	}
 
@@ -1957,23 +1865,22 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 	expected = 0xffffffff >> (31 - segN);
 
 	if (sar_in) {
-		l_info("RXed (old: %04x %06x size:%d) %d of %d",
+		l_debug("RXed (old: %04x %06x size:%d) %d of %d",
 					seqZero, seq, size, segO, segN);
 		/* Sanity Check--> certain things must match */
-		if (SEG_MAX(sar_in->len) != segN ||
+		if (SEG_MAX(true, sar_in->len) != segN ||
 				sar_in->key_aid != key_aid)
 			return false;
 
 		if (sar_in->flags == expected) {
 			/* Re-Send ACK for full msg */
-			if (!net->friend_addr)
-				send_net_ack(net, sar_in, expected);
+			send_net_ack(net, sar_in, expected);
 			return true;
 		}
 	} else {
 		uint16_t len = MAX_SEG_TO_LEN(segN);
 
-		l_info("RXed (new: %04x %06x size: %d len: %d) %d of %d",
+		l_debug("RXed (new: %04x %06x size: %d len: %d) %d of %d",
 				seqZero, seq, size, len, segO, segN);
 		l_debug("Queue Size: %d", l_queue_length(net->sar_in));
 		sar_in = mesh_sar_new(len);
@@ -1985,14 +1892,13 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 		sar_in->key_aid = key_aid;
 		sar_in->len = len;
 		sar_in->last_seg = 0xff;
-		if (!net->friend_addr)
-			sar_in->msg_timeout = l_timeout_create(MSG_TO,
+		sar_in->net_idx = net_idx;
+		sar_in->msg_timeout = l_timeout_create(MSG_TO,
 					inmsg_to, net, NULL);
 
 		l_debug("First Seg %4.4x", sar_in->flags);
 		l_queue_push_head(net->sar_in, sar_in);
 	}
-	/* print_packet("Seg", data, size); */
 
 	seg_off = segO * MAX_SEG_LEN;
 	memcpy(sar_in->buf + seg_off, data, size);
@@ -2005,22 +1911,17 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 	sar_in->flags |= this_seg_flag;
 	sar_in->ttl = ttl;
 
-	l_debug("Have Frags %4.4x", sar_in->flags);
-
 	/* Msg length only definitive on last segment */
 	if (segO == segN)
 		sar_in->len = segN * MAX_SEG_LEN + size;
 
 	if (sar_in->flags == expected) {
 		/* Got it all */
-		if (!net->friend_addr)
-			send_net_ack(net, sar_in, expected);
+		send_net_ack(net, sar_in, expected);
 
 		msg_rxed(net, frnd, iv_index, ttl, seq, net_idx,
-				sar_in->remote, dst,
-				key_aid,
-				szmic, sar_in->seqZero,
-				sar_in->buf, sar_in->len);
+				sar_in->remote, dst, key_aid, true, szmic,
+				sar_in->seqZero, sar_in->buf, sar_in->len);
 
 		/* Kill Inter-Seg timeout */
 		l_timeout_remove(sar_in->seg_timeout);
@@ -2033,15 +1934,12 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 		l_timeout_remove(sar_in->seg_timeout);
 
 		/* if this is the largest outstanding segment, send NAK now */
-		if (!net->friend_addr) {
-			largest = (0xffffffff << segO) & expected;
-			if ((largest & sar_in->flags) == largest)
-				send_net_ack(net, sar_in, sar_in->flags);
+		largest = (0xffffffff << segO) & expected;
+		if ((largest & sar_in->flags) == largest)
+			send_net_ack(net, sar_in, sar_in->flags);
 
-			sar_in->seg_timeout = l_timeout_create(SEG_TO,
+		sar_in->seg_timeout = l_timeout_create(SEG_TO,
 				inseg_to, net, NULL);
-		} else
-			largest = 0;
 	} else
 		largest = 0;
 
@@ -2050,8 +1948,8 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 	return false;
 }
 
-static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
-						uint8_t ttl,
+static bool ctl_received(struct mesh_net *net, uint16_t key_id,
+						uint32_t iv_index, uint8_t ttl,
 						uint32_t seq,
 						uint16_t src, uint16_t dst,
 						uint8_t opcode, int8_t rssi,
@@ -2060,17 +1958,14 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 	uint8_t msg[12];
 	uint8_t rsp_ttl = DEFAULT_TTL;
 	uint8_t n = 0;
+	uint16_t net_idx;
 
-	if (!frnd && ttl > 1) {
+	if (ttl > 1) {
 		uint32_t hdr = opcode << OPCODE_HDR_SHIFT;
 		uint8_t frnd_ttl = ttl - 1;
 
-		if (friend_packet_queue(net, iv_index,
-					true, frnd_ttl,
-					seq,
-					src, dst,
-					hdr,
-					pkt, len))
+		if (friend_packet_queue(net, iv_index, true, frnd_ttl, seq,
+						src, dst, hdr, pkt, len))
 			return true;
 	}
 
@@ -2088,18 +1983,8 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			return false;
 
 		print_packet("Rx-NET_OP_FRND_POLL", pkt, len);
-		friend_poll(net, src, !!(pkt[0]),
-				l_queue_find(net->friends,
-						match_by_friend,
-						L_UINT_TO_PTR(src)));
-		break;
-
-	case NET_OP_FRND_UPDATE:
-		if (ttl)
-			return false;
-
-		print_packet("Rx-NET_OP_FRND_UPDATE", pkt, len);
-		lpn_process_beacon(net, pkt, len, 0);
+		friend_poll(net, src, !!(pkt[0]), l_queue_find(net->friends,
+					match_by_friend, L_UINT_TO_PTR(src)));
 		break;
 
 	case NET_OP_FRND_REQUEST:
@@ -2113,19 +1998,11 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			return false;
 
 		print_packet("Rx-NET_OP_FRND_REQUEST", pkt, len);
-		friend_request(net, src, pkt[0], pkt[1],
+		net_idx = key_id_to_net_idx(net, key_id);
+		friend_request(net, net_idx, src, pkt[0], pkt[1],
 				l_get_be32(pkt + 1) & 0xffffff,
 				l_get_be16(pkt + 5), pkt[7],
 				l_get_be16(pkt + 8), rssi);
-		break;
-
-	case NET_OP_FRND_OFFER:
-		if (len != 6 || ttl)
-			return false;
-
-		print_packet("Rx-NET_OP_FRND_OFFER", pkt, len);
-		frnd_offer(net, src, pkt[0], pkt[1], pkt[2],
-				(int8_t) pkt[3], rssi, l_get_be16(pkt + 4));
 		break;
 
 	case NET_OP_FRND_CLEAR_CONFIRM:
@@ -2143,10 +2020,9 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 
 		print_packet("Rx-NET_OP_FRND_CLEAR", pkt, len);
 		friend_clear(net, src, l_get_be16(pkt), l_get_be16(pkt + 2),
-				l_queue_find(net->friends,
-					match_by_friend,
+				l_queue_find(net->friends, match_by_friend,
 					L_UINT_TO_PTR(l_get_be16(pkt))));
-		l_info("Remaining Friends: %d", l_queue_length(net->friends));
+		l_debug("Remaining Friends: %d", l_queue_length(net->friends));
 		break;
 
 	case NET_OP_PROXY_SUB_ADD:
@@ -2164,9 +2040,8 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			return false;
 
 		print_packet("Rx-NET_OP_PROXY_SUB_REMOVE", pkt, len);
-		friend_sub_del(net, l_queue_find(net->friends,
-					match_by_friend, L_UINT_TO_PTR(src)),
-				pkt, len);
+		friend_sub_del(net, l_queue_find(net->friends, match_by_friend,
+						L_UINT_TO_PTR(src)), pkt, len);
 		break;
 
 	case NET_OP_PROXY_SUB_CONFIRM:
@@ -2192,7 +2067,7 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			if (net->heartbeat.sub_max_hops < hops)
 				net->heartbeat.sub_max_hops = hops;
 
-			l_info("HB: cnt:%4.4x min:%2.2x max:%2.2x",
+			l_debug("HB: cnt:%4.4x min:%2.2x max:%2.2x",
 					net->heartbeat.sub_count,
 					net->heartbeat.sub_min_hops,
 					net->heartbeat.sub_max_hops);
@@ -2200,12 +2075,10 @@ static bool ctl_received(struct mesh_net *net, bool frnd, uint32_t iv_index,
 		break;
 	}
 
-	if (n) {
-		mesh_net_transport_send(net, 0, false,
-				mesh_net_get_iv_index(net), rsp_ttl,
-				0, dst & 0x8000 ? 0 : dst, src,
-				msg, n);
-	}
+	if (n)
+		mesh_net_transport_send(net, 0, 0, mesh_net_get_iv_index(net),
+					rsp_ttl, 0, dst & 0x8000 ? 0 : dst,
+					src, msg, n);
 
 	return true;
 }
@@ -2263,24 +2136,35 @@ static void send_relay_pkt(struct mesh_net *net, uint8_t *data, uint8_t size)
 	mesh_io_send(io, &info, packet, size + 1);
 }
 
-static void send_msg_pkt(struct mesh_net *net, uint8_t *packet, uint8_t size)
+static bool simple_match(const void *a, const void *b)
 {
-	struct mesh_io *io = net->io;
+	return a == b;
+}
+
+static void send_msg_pkt_oneshot(void *user_data)
+{
+	struct oneshot_tx *tx = user_data;
+	struct mesh_net *net;
 	struct mesh_io_send_info info;
 	struct net_queue_data net_data = {
 		.info = NULL,
-		.data = packet + 1,
-		.len = size - 1,
+		.data = tx->packet + 1,
+		.len = tx->size - 1,
 		.relay_advice = RELAY_NONE,
 	};
 
 	/* Send to local nodes first */
 	l_queue_foreach(nets, net_rx, &net_data);
 
-	if (net_data.relay_advice == RELAY_DISALLOWED)
-		return;
+	/* Make sure specific network still valid */
+	net = l_queue_find(nets, simple_match, tx->net);
 
-	packet[0] = MESH_AD_TYPE_NETWORK;
+	if (!net || net_data.relay_advice == RELAY_DISALLOWED) {
+		l_free(tx);
+		return;
+	}
+
+	tx->packet[0] = MESH_AD_TYPE_NETWORK;
 	info.type = MESH_IO_TIMING_TYPE_GENERAL;
 	info.u.gen.interval = net->tx_interval;
 	info.u.gen.cnt = net->tx_cnt;
@@ -2288,23 +2172,19 @@ static void send_msg_pkt(struct mesh_net *net, uint8_t *packet, uint8_t size)
 	/* No extra randomization when sending regular mesh messages */
 	info.u.gen.max_delay = DEFAULT_MIN_DELAY;
 
-	mesh_io_send(io, &info, packet, size);
+	mesh_io_send(net->io, &info, tx->packet, tx->size);
+	l_free(tx);
 }
 
-static uint16_t key_id_to_net_idx(struct mesh_net *net, uint32_t key_id)
+static void send_msg_pkt(struct mesh_net *net, uint8_t *packet, uint8_t size)
 {
-	struct mesh_subnet *subnet;
+	struct oneshot_tx *tx = l_new(struct oneshot_tx, 1);
 
-	if (!net)
-		return NET_IDX_INVALID;
+	tx->net = net;
+	tx->size = size;
+	memcpy(tx->packet, packet, size);
 
-	subnet = l_queue_find(net->subnets, match_key_id,
-						L_UINT_TO_PTR(key_id));
-
-	if (subnet)
-		return subnet->idx;
-	else
-		return NET_IDX_INVALID;
+	l_idle_oneshot(send_msg_pkt_oneshot, tx, NULL);
 }
 
 static enum _relay_advice packet_received(void *user_data,
@@ -2320,54 +2200,26 @@ static enum _relay_advice packet_received(void *user_data,
 	uint16_t net_idx;
 	uint8_t packet[31];
 	bool net_ctl, net_segmented, net_szmic, net_relay;
-	struct mesh_friend *net_frnd = NULL;
-	bool drop = false;
-
-	/* Tester--Drop 90% of packets */
-	/* l_getrandom(&iv_flag, 1); */
-	/* if (iv_flag%10<9) drop = true; */
-
 
 	memcpy(packet + 2, data, size);
-
-	if (!drop)
-		print_packet("RX: Network [clr] :", packet + 2, size);
 
 	net_idx = key_id_to_net_idx(net, key_id);
 	if (net_idx == NET_IDX_INVALID)
 		return RELAY_NONE;
 
-	if (!mesh_crypto_packet_parse(packet + 2, size,
-					&net_ctl, &net_ttl,
-					&net_seq,
-					&net_src, &net_dst,
-					&cache_cookie,
-					&net_opcode,
-					&net_segmented,
-					&net_key_id,
-					&net_szmic, &net_relay, &net_seqZero,
-					&net_segO, &net_segN,
-					&msg, &app_msg_len)) {
+	print_packet("RX: Network [clr] :", packet + 2, size);
+
+	if (!mesh_crypto_packet_parse(packet + 2, size, &net_ctl, &net_ttl,
+					&net_seq, &net_src, &net_dst,
+					&cache_cookie, &net_opcode,
+					&net_segmented, &net_key_id, &net_szmic,
+					&net_relay, &net_seqZero, &net_segO,
+					&net_segN, &msg, &app_msg_len)) {
 		l_error("Failed to parse packet content");
 		return RELAY_NONE;
 	}
 
-	/* Ignore incoming packets if we are LPN and frnd bit not set */
-	if (net->friend_addr) {
-		struct mesh_subnet *subnet;
-
-		subnet = l_queue_find(net->subnets, match_key_id,
-							L_UINT_TO_PTR(key_id));
-		if (subnet)
-			return RELAY_NONE;
-
-		/* If the queue is empty, stop polling */
-		if (net_ctl && net_opcode == NET_OP_FRND_UPDATE && !msg[5])
-			frnd_poll_cancel(net);
-		else
-			frnd_poll(net, false);
-
-	} else if (net_dst == 0) {
+	if (net_dst == 0) {
 		l_error("illegal parms: DST: %4.4x Ctl: %d TTL: %2.2x",
 						net_dst, net_ctl, net_ttl);
 		return RELAY_NONE;
@@ -2377,15 +2229,10 @@ static enum _relay_advice packet_received(void *user_data,
 	if (is_us(net, net_src, true))
 		return RELAY_NONE;
 
-	if (drop) {
-		l_info("Dropping SEQ 0x%06x", net_seq);
-		return RELAY_NONE;
-	}
-
-	l_debug("check %08x", cache_cookie);
-
-	/* As a Relay, suppress repeats of last N packets that pass through */
-	/* The "cache_cookie" should be unique part of App message */
+	/*
+	 * As a Relay, suppress repeats of last N packets that pass through
+	 * The "cache_cookie" should be unique part of App message.
+	 */
 	if (msg_in_cache(net, net_src, net_seq, cache_cookie))
 		return RELAY_NONE;
 
@@ -2393,13 +2240,11 @@ static enum _relay_advice packet_received(void *user_data,
 			net_src, net_dst, net_ttl, iv_index, net_seq);
 
 	if (is_us(net, net_dst, false) ||
-			is_lpn_friend(net, net_src, !!(net_frnd)) ||
 			(net_ctl && net_opcode == NET_OP_HEARTBEAT)) {
 
-		l_info("RX: App 0x%04x -> 0x%04x : TTL 0x%02x : SEQ 0x%06x",
+		l_debug("RX: App 0x%04x -> 0x%04x : TTL 0x%02x : SEQ 0x%06x",
 					net_src, net_dst, net_ttl, net_seq);
 
-		l_debug("seq:%x seq0:%x", net_seq, net_seqZero);
 		if (net_ctl) {
 			l_debug("CTL - %4.4x RX", net_seqZero);
 			if (net_opcode == NET_OP_SEG_ACKNOWLEDGE) {
@@ -2407,67 +2252,56 @@ static enum _relay_advice packet_received(void *user_data,
 				if (net_dst & 0x8000)
 					return RELAY_NONE;
 
-				/* print_packet("Got ACK", msg, app_msg_len); */
 				/* Pedantic check for correct size */
 				if (app_msg_len != 7)
 					return RELAY_NONE;
 
 				/* If this is an ACK to our friend queue-only */
-				if (is_lpn_friend(net, net_dst, true))
+				if (is_lpn_friend(net, net_dst))
 					friend_ack_rxed(net, iv_index, net_seq,
-							net_src, net_dst,
-							msg);
+							net_src, net_dst, msg);
 				else
 					ack_received(net, false,
 							net_src, net_dst,
 							net_seqZero,
 							l_get_be32(msg + 3));
 			} else {
-				ctl_received(net, !!(net_frnd), iv_index,
-						net_ttl, net_seq, net_src,
-						net_dst, net_opcode, rssi,
-						msg, app_msg_len);
+				ctl_received(net, key_id, iv_index, net_ttl,
+						net_seq, net_src, net_dst,
+						net_opcode, rssi, msg,
+								app_msg_len);
 			}
 		} else if (net_segmented) {
-			/* If we accept SAR packets to non-Unicast, then
+			/*
+			 * If we accept SAR packets to non-Unicast, then
 			 * Friend Sar at least needs to be Unicast Only
 			 */
-			if (is_lpn_friend(net, net_dst, true) &&
+			if (is_lpn_friend(net, net_dst) &&
 							!(net_dst & 0x8000)) {
-				/* Check TTL >= 2 before accepting segments
+				/*
+				 * Check TTL >= 2 before accepting segments
 				 * for Friends
 				 */
 				if (net_ttl >= 2) {
-					friend_seg_rxed(net, iv_index,
-						net_ttl, net_seq,
-						net_src, net_dst,
+					friend_seg_rxed(net, iv_index, net_ttl,
+						net_seq, net_src, net_dst,
 						l_get_be32(packet + 2 + 9),
 						msg, app_msg_len);
 				}
 			} else {
-				seg_rxed(net, net_frnd, iv_index, net_ttl,
-						net_seq, net_idx,
-						net_src, net_dst,
-						net_key_id,
-						net_szmic, net_seqZero,
-						net_segO, net_segN,
+				seg_rxed(net, NULL, iv_index, net_ttl,
+						net_seq, net_idx, net_src,
+						net_dst, net_key_id, net_szmic,
+						net_seqZero, net_segO, net_segN,
 						msg, app_msg_len);
 			}
 
 		} else {
-			msg_rxed(net, net_frnd,
-						iv_index,
-						net_ttl,
-						net_seq,
-						net_idx,
-						net_src, net_dst,
-						net_key_id,
-						false, net_seq & SEQ_ZERO_MASK,
-						msg, app_msg_len);
+			msg_rxed(net, NULL, iv_index, net_ttl, net_seq, net_idx,
+					net_src, net_dst, net_key_id, false,
+					false, net_seq & SEQ_ZERO_MASK, msg,
+					app_msg_len);
 		}
-
-		if (!!(net_frnd))
-			l_info("Ask for more data!");
 
 		/* If this is one of our Unicast addresses, disallow relay */
 		if (IS_UNICAST(net_dst))
@@ -2475,7 +2309,7 @@ static enum _relay_advice packet_received(void *user_data,
 	}
 
 	/* If relay not enable, or no more hops allowed */
-	if (!net->relay.enable || net_ttl < 0x02 || net_frnd)
+	if (!net->relay.enable || net_ttl < 0x02)
 		return RELAY_NONE;
 
 	/* Group or Virtual destinations should *always* be relayed */
@@ -2512,7 +2346,10 @@ static void net_rx(void *net_ptr, void *user_data)
 	if (!key_id)
 		return;
 
-	print_packet("RX: Network [enc] :", data->data, data->len);
+	if (!data->seen) {
+		data->seen = true;
+		print_packet("RX: Network [enc] :", data->data, data->len);
+	}
 
 	if (data->info) {
 		net->instant = data->info->instant;
@@ -2520,8 +2357,8 @@ static void net_rx(void *net_ptr, void *user_data)
 		rssi = data->info->rssi;
 	}
 
-	relay_advice = packet_received(net, key_id, iv_index,
-							out, out_size, rssi);
+	relay_advice = packet_received(net, key_id, iv_index, out, out_size,
+									rssi);
 	if (relay_advice > data->relay_advice) {
 		data->iv_index = iv_index;
 		data->relay_advice = relay_advice;
@@ -2542,6 +2379,7 @@ static void net_msg_recv(void *user_data, struct mesh_io_recv_info *info,
 		.data = data + 1,
 		.len = len - 1,
 		.relay_advice = RELAY_NONE,
+		.seen = false,
 	};
 
 	if (len < 9)
@@ -2568,58 +2406,15 @@ static void net_msg_recv(void *user_data, struct mesh_io_recv_info *info,
 	}
 }
 
-static void set_network_beacon(void *a, void *b)
-{
-	struct mesh_subnet *subnet = a;
-	struct mesh_net *net = b;
-	uint8_t beacon_data[22];
-
-	if (!create_secure_beacon(net, subnet, beacon_data))
-		return;
-
-	if (memcmp(&subnet->snb.beacon[1], beacon_data,
-						sizeof(beacon_data)) == 0)
-		return;
-
-	memcpy(&subnet->snb.beacon[1], beacon_data, sizeof(beacon_data));
-
-	if (net->beacon_enable && !net->friend_addr) {
-		print_packet("Set My Beacon to",
-			beacon_data, sizeof(beacon_data));
-		start_network_beacon(subnet, net);
-	}
-
-	if (l_queue_length(net->friends)) {
-		struct mesh_friend_msg update = {
-			.src = net->src_addr,
-			.iv_index = mesh_net_get_iv_index(net),
-			.last_len = 7,
-			.ctl = true,
-		};
-
-		update.u.one[0].hdr = NET_OP_FRND_UPDATE << OPCODE_HDR_SHIFT;
-		update.u.one[0].seq = mesh_net_next_seq_num(net);
-		update.u.one[0].data[0] = NET_OP_FRND_UPDATE;
-		update.u.one[0].data[1] = beacon_data[3];
-		l_put_be32(net->iv_index, update.u.one[0].data + 2);
-		update.u.one[0].data[6] = 0x01; /* More Data */
-		/* print_packet("Frnd-Beacon-SRC",
-		 *			beacon_data, sizeof(beacon_data));
-		 */
-		/* print_packet("Frnd-Update", update.u.one[0].data, 6); */
-
-		l_queue_foreach(net->friends, enqueue_update, &update);
-	}
-}
-
 static void iv_upd_to(struct l_timeout *upd_timeout, void *user_data)
 {
 	struct mesh_net *net = user_data;
 
 	switch (net->iv_upd_state) {
 	case IV_UPD_UPDATING:
-		if (l_queue_length(net->sar_out)) {
-			l_info("don't leave IV Update until sar_out empty");
+		if (l_queue_length(net->sar_out) ||
+					l_queue_length(net->sar_queue)) {
+			l_debug("don't leave IV Update until sar_out empty");
 			l_timeout_modify(net->iv_update_timeout, 10);
 			break;
 		}
@@ -2627,14 +2422,16 @@ static void iv_upd_to(struct l_timeout *upd_timeout, void *user_data)
 		l_debug("iv_upd_state = IV_UPD_NORMAL_HOLD");
 		net->iv_upd_state = IV_UPD_NORMAL_HOLD;
 		l_timeout_modify(net->iv_update_timeout, IV_IDX_UPD_MIN);
+
 		if (net->iv_update)
 			mesh_net_set_seq_num(net, 0);
 
 		net->iv_update = false;
 		mesh_config_write_iv_index(node_config_get(net->node),
 							net->iv_index, false);
-		l_queue_foreach(net->subnets, set_network_beacon, net);
-		mesh_net_flush_msg_queues(net);
+		l_queue_foreach(net->subnets, refresh_beacon, net);
+		queue_friend_update(net);
+		l_queue_clear(net->msg_cache, l_free);
 		break;
 
 	case IV_UPD_INIT:
@@ -2644,10 +2441,12 @@ static void iv_upd_to(struct l_timeout *upd_timeout, void *user_data)
 		net->iv_update_timeout = NULL;
 		l_debug("iv_upd_state = IV_UPD_NORMAL");
 		net->iv_upd_state = IV_UPD_NORMAL;
+
 		if (net->iv_update)
 			mesh_net_set_seq_num(net, 0);
 
 		net->iv_update = false;
+
 		if (net->seq_num > IV_UPDATE_SEQ_TRIGGER)
 			mesh_net_iv_index_update(net);
 		break;
@@ -2668,19 +2467,18 @@ static int key_refresh_phase_two(struct mesh_net *net, uint16_t idx)
 	if (!subnet || !subnet->net_key_upd)
 		return MESH_STATUS_INVALID_NETKEY;
 
-	l_info("Key refresh procedure phase 2: start using new net TX keys");
+	l_debug("Key refresh procedure phase 2: start using new net TX keys");
 	subnet->key_refresh = 1;
 	subnet->net_key_tx = subnet->net_key_upd;
-	/* TODO: Provisioner may need to stay in phase three until
+	/*
+	 * TODO: Provisioner may need to stay in phase three until
 	 * it hears beacons from all the nodes
 	 */
 	subnet->kr_phase = KEY_REFRESH_PHASE_TWO;
-	set_network_beacon(subnet, net);
+	refresh_beacon(subnet, net);
+	queue_friend_update(net);
 
-	if (net->friend_addr)
-		frnd_key_refresh(net, 2);
-	else
-		l_queue_foreach(net->friends, frnd_kr_phase2, net);
+	l_queue_foreach(net->friends, frnd_kr_phase2, net);
 
 	mesh_config_net_key_set_phase(node_config_get(net->node), idx,
 						KEY_REFRESH_PHASE_TWO);
@@ -2703,7 +2501,7 @@ static int key_refresh_finish(struct mesh_net *net, uint16_t idx)
 	if (subnet->kr_phase == KEY_REFRESH_PHASE_NONE)
 		return MESH_STATUS_SUCCESS;
 
-	l_info("Key refresh phase 3: use new keys only, discard old ones");
+	l_debug("Key refresh phase 3: use new keys only, discard old ones");
 
 	/* Switch to using new keys, discard old ones */
 	net_key_unref(subnet->net_key_cur);
@@ -2711,12 +2509,10 @@ static int key_refresh_finish(struct mesh_net *net, uint16_t idx)
 	subnet->net_key_upd = 0;
 	subnet->key_refresh = 0;
 	subnet->kr_phase = KEY_REFRESH_PHASE_NONE;
-	set_network_beacon(subnet, net);
+	refresh_beacon(subnet, net);
+	queue_friend_update(net);
 
-	if (net->friend_addr)
-		frnd_key_refresh(net, 3);
-	else
-		l_queue_foreach(net->friends, frnd_kr_phase3, net);
+	l_queue_foreach(net->friends, frnd_kr_phase3, net);
 
 	mesh_config_net_key_set_phase(node_config_get(net->node), idx,
 							KEY_REFRESH_PHASE_NONE);
@@ -2743,14 +2539,7 @@ static void update_kr_state(struct mesh_subnet *subnet, bool kr, uint32_t id)
 static void update_iv_ivu_state(struct mesh_net *net, uint32_t iv_index,
 								bool ivu)
 {
-	uint32_t local_iv_index;
-	bool local_ivu;
-
-	/* Save original settings to differentiate what has changed */
-	local_iv_index = net->iv_index;
-	local_ivu = net->iv_update;
-
-	if ((iv_index - ivu) > (local_iv_index - local_ivu)) {
+	if ((iv_index - ivu) > (net->iv_index - net->iv_update)) {
 		/* Don't accept IV_Index changes when performing SAR Out */
 		if (l_queue_length(net->sar_out))
 			return;
@@ -2759,44 +2548,57 @@ static void update_iv_ivu_state(struct mesh_net *net, uint32_t iv_index,
 	/* If first beacon seen, accept without judgement */
 	if (net->iv_upd_state == IV_UPD_INIT) {
 		if (ivu) {
-			/* Other devices will be accepting old or new iv_index,
+			/* Ignore beacons with IVU if IV already updated */
+			if (iv_index == net->iv_index && !net->iv_update)
+				return;
+
+			/*
+			 * Other devices will be accepting old or new iv_index,
 			 * but we don't know how far through update they are.
 			 * Starting permissive state will allow us maximum
 			 * (96 hours) to resync
 			 */
-			l_info("iv_upd_state = IV_UPD_UPDATING");
+			l_debug("iv_upd_state = IV_UPD_UPDATING");
 			net->iv_upd_state = IV_UPD_UPDATING;
 			net->iv_update_timeout = l_timeout_create(
-				IV_IDX_UPD_MIN, iv_upd_to, net, NULL);
+					IV_IDX_UPD_MIN, iv_upd_to, net, NULL);
 		} else {
-			l_info("iv_upd_state = IV_UPD_NORMAL");
+			l_debug("iv_upd_state = IV_UPD_NORMAL");
 			net->iv_upd_state = IV_UPD_NORMAL;
 		}
 	} else if (ivu) {
 		/* Ignore beacons with IVU if they come too soon */
-		if (!local_ivu && net->iv_upd_state == IV_UPD_NORMAL_HOLD) {
+		if (!net->iv_update &&
+				net->iv_upd_state == IV_UPD_NORMAL_HOLD) {
 			l_error("Update attempted too soon");
 			return;
 		}
 
-		if (!local_ivu) {
-			l_info("iv_upd_state = IV_UPD_UPDATING");
+		/* Ignore beacons with IVU if IV already updated */
+		if (iv_index == net->iv_index)
+			return;
+
+		if (!net->iv_update) {
+			l_debug("iv_upd_state = IV_UPD_UPDATING");
 			net->iv_upd_state = IV_UPD_UPDATING;
 			net->iv_update_timeout = l_timeout_create(
 					IV_IDX_UPD_MIN, iv_upd_to, net, NULL);
 		}
-	} else if (local_ivu) {
+	} else if (net->iv_update) {
 		l_error("IVU clear attempted too soon");
 		return;
 	}
 
-	if ((iv_index - ivu) > (local_iv_index - local_ivu))
+	if ((iv_index - ivu) > (net->iv_index - net->iv_update))
 		mesh_net_set_seq_num(net, 0);
 
-	if (ivu != net->iv_update || local_iv_index != net->iv_index) {
+	if (ivu != net->iv_update || iv_index != net->iv_index) {
 		struct mesh_config *cfg = node_config_get(net->node);
 
 		mesh_config_write_iv_index(cfg, iv_index, ivu);
+
+		/* Cleanup Replay Protection List NVM */
+		rpl_init(net->node, iv_index);
 	}
 
 	net->iv_index = iv_index;
@@ -2806,123 +2608,109 @@ static void update_iv_ivu_state(struct mesh_net *net, uint32_t iv_index,
 static void process_beacon(void *net_ptr, void *user_data)
 {
 	struct mesh_net *net = net_ptr;
-	const uint8_t *buf = *(uint8_t **)user_data;
+	struct net_beacon_data *beacon_data = user_data;
 	uint32_t ivi;
 	bool ivu, kr, local_kr;
 	struct mesh_subnet *subnet;
-	uint32_t key_id;
 
-	ivi = l_get_be32(buf + 10);
+	ivi = beacon_data->ivi;
 
 	/* Ignore out-of-range IV_Index for this network */
 	if ((net->iv_index + IV_IDX_DIFF_RANGE < ivi) || (ivi < net->iv_index))
 		return;
 
-	/* Ignore Network IDs unknown to this mesh universe */
-	key_id = net_key_network_id(buf + 2);
-	if (!key_id)
-		return;
-
+	/* Ignore beacons not in this universe */
 	subnet = l_queue_find(net->subnets, match_key_id,
-							L_UINT_TO_PTR(key_id));
+					L_UINT_TO_PTR(beacon_data->key_id));
+
 	if (!subnet)
 		return;
 
 	/* Get IVU and KR boolean bits from beacon */
-	ivu = !!(buf[1] & 0x02);
-	kr = !!(buf[1] & 0x01);
-	local_kr = !!(subnet->kr_phase != KEY_REFRESH_PHASE_TWO);
-
-	if (net->iv_upd_state != IV_UPD_INIT) {
-		/* Ignore beacons that indicate *no change* */
-		if (!memcmp(&subnet->snb.beacon[1], buf, 22)) {
-			subnet->snb.observed++;
-			return;
-		}
-	}
-
-	/* Validate beacon before accepting */
-	if (!net_key_snb_check(key_id, ivi, kr, ivu, l_get_be64(buf + 14))) {
-		l_error("mesh_crypto_beacon verify failed");
-		return;
-	}
+	ivu = beacon_data->ivu;
+	kr = beacon_data->kr;
+	local_kr = !!(subnet->kr_phase == KEY_REFRESH_PHASE_TWO);
 
 	/* We have officially *seen* this beacon now */
-	subnet->snb.observed++;
+	beacon_data->processed = true;
 
-	update_iv_ivu_state(net, ivi, ivu);
-	update_kr_state(subnet, kr, key_id);
+	/*
+	 * Ignore the beacon if it doesn't change anything, unless we're
+	 * doing IV Recovery
+	 */
+	if (net->iv_upd_state == IV_UPD_INIT || ivi != net->iv_index ||
+							ivu != net->iv_update)
+		update_iv_ivu_state(net, ivi, ivu);
 
-	if (ivi != net->iv_index || ivu != net->iv_update || kr != local_kr)
-		set_network_beacon(subnet, net);
-}
+	if (kr != local_kr)
+		update_kr_state(subnet, kr, beacon_data->key_id);
 
-static void lpn_process_beacon(void *user_data, const void *data,
-						uint8_t size, int8_t rssi)
-{
-	struct mesh_net *net = user_data;
-	const uint8_t *buf = data;
-	uint32_t ivi;
-	bool ivu, kr, local_kr;
-	struct mesh_subnet *subnet;
-	bool kr_transition = false;
-
-	/* print_packet("lpn: Secure Net Beacon RXed", data, size); */
-	kr = !!(buf[0] & 0x01);
-	ivu = !!(buf[0] & 0x02);
-	ivi = l_get_be32(buf + 1);
-
-	l_debug("KR: %d -- IVU: %d -- IVI: %8.8x", kr, ivu, ivi);
-
-	/* TODO: figure out actual network index (i.e., friendship subnet) */
-	subnet = get_primary_subnet(net);
-	if (!subnet)
-		return;
-
-	local_kr = (subnet->kr_phase == KEY_REFRESH_PHASE_TWO);
-
-	/* Don't bother going further if nothing has changed */
-	if (local_kr == kr && ivi == net->iv_index && ivu == net->iv_update &&
-					net->iv_upd_state != IV_UPD_INIT)
-		return;
-
-	update_iv_ivu_state(net, ivi, ivu);
-
-	if (kr)
-		update_kr_state(subnet, kr_transition, subnet->net_key_upd);
-	else
-		update_kr_state(subnet, kr_transition, subnet->net_key_cur);
+	net_key_beacon_refresh(beacon_data->key_id, net->iv_index,
+		!!(subnet->kr_phase == KEY_REFRESH_PHASE_TWO), net->iv_update);
 }
 
 static void beacon_recv(void *user_data, struct mesh_io_recv_info *info,
 					const uint8_t *data, uint16_t len)
 {
-	const uint8_t *ptr = data + 1;
+	struct net_beacon_data beacon_data = {
+		.processed = false,
+	};
 
 	if (len != 23 || data[1] != 0x01)
 		return;
 
-	l_debug("KR: %d -- IVU: %d -- IV: %8.8x",
-			data[2] & 1, !!(data[2] & 2), l_get_be32(data + 11));
+	/* Ignore Network IDs unknown to this daemon */
+	beacon_data.key_id = net_key_network_id(data + 3);
+	if (!beacon_data.key_id)
+		return;
 
-	l_queue_foreach(nets, process_beacon, &ptr);
+	/* Get data bits from beacon */
+	beacon_data.ivu = !!(data[2] & 0x02);
+	beacon_data.kr = !!(data[2] & 0x01);
+	beacon_data.ivi = l_get_be32(data + 11);
+
+	/* Validate beacon before accepting */
+	if (!net_key_snb_check(beacon_data.key_id, beacon_data.ivi,
+					beacon_data.kr, beacon_data.ivu,
+					l_get_be64(data + 15))) {
+		l_error("mesh_crypto_beacon verify failed");
+		return;
+	}
+
+	l_queue_foreach(nets, process_beacon, &beacon_data);
+
+	if (beacon_data.processed)
+		net_key_beacon_seen(beacon_data.key_id);
+}
+
+void net_local_beacon(uint32_t key_id, uint8_t *beacon)
+{
+	struct net_beacon_data beacon_data = {
+		.key_id = key_id,
+		.ivu = !!(beacon[2] & 0x02),
+		.kr = !!(beacon[2] & 0x01),
+		.ivi = l_get_be32(beacon + 11),
+	};
+
+	/* Deliver locally generated beacons to all nodes */
+	l_queue_foreach(nets, process_beacon, &beacon_data);
 }
 
 bool mesh_net_set_beacon_mode(struct mesh_net *net, bool enable)
 {
-	if (!net || !IS_UNASSIGNED(net->friend_addr))
+	if (!net)
 		return false;
 
-	if (net->beacon_enable != enable) {
-		uint8_t type = MESH_AD_TYPE_BEACON;
+	if (net->beacon_enable == enable)
+		return true;
 
-		net->beacon_enable = enable;
+	net->beacon_enable = enable;
 
-		if (!enable)
-			mesh_io_send_cancel(net->io, &type, 1);
+	if (enable)
+		l_queue_foreach(net->subnets, refresh_beacon, net);
 
-		l_queue_foreach(net->subnets, start_network_beacon, net);
-	}
+	l_queue_foreach(net->subnets, enable_beacon, net);
+	queue_friend_update(net);
 
 	return true;
 }
@@ -2958,21 +2746,21 @@ bool mesh_net_set_key(struct mesh_net *net, uint16_t idx, const uint8_t *key,
 	if (phase == KEY_REFRESH_PHASE_TWO) {
 		subnet->key_refresh = 1;
 		subnet->net_key_tx = subnet->net_key_upd;
+
+		if (net->beacon_enable) {
+			/* Switch beaconing key */
+			net_key_beacon_disable(subnet->net_key_cur);
+			net_key_beacon_enable(subnet->net_key_upd);
+		}
 	}
 
 	subnet->kr_phase = phase;
 
-	set_network_beacon(subnet, net);
+	net_key_beacon_refresh(subnet->net_key_tx, net->iv_index,
+		!!(subnet->kr_phase == KEY_REFRESH_PHASE_TWO), net->iv_update);
 
-	if (net->io)
-		start_network_beacon(subnet, net);
 
 	return true;
-}
-
-static bool is_this_net(const void *a, const void *b)
-{
-	return a == b;
 }
 
 bool mesh_net_attach(struct mesh_net *net, struct mesh_io *io)
@@ -2984,21 +2772,22 @@ bool mesh_net_attach(struct mesh_net *net, struct mesh_io *io)
 
 	first = l_queue_isempty(nets);
 	if (first) {
+		uint8_t snb[] = {MESH_AD_TYPE_BEACON, 0x01};
+		uint8_t pkt[] = {MESH_AD_TYPE_NETWORK};
+
 		if (!nets)
 			nets = l_queue_new();
 
 		if (!fast_cache)
 			fast_cache = l_queue_new();
 
-		l_info("Register io cb");
-		mesh_io_register_recv_cb(io, MESH_IO_FILTER_BEACON,
+		mesh_io_register_recv_cb(io, snb, sizeof(snb),
 							beacon_recv, NULL);
-		mesh_io_register_recv_cb(io, MESH_IO_FILTER_NET,
+		mesh_io_register_recv_cb(io, pkt, sizeof(pkt),
 							net_msg_recv, NULL);
-		l_queue_foreach(net->subnets, start_network_beacon, net);
 	}
 
-	if (l_queue_find(nets, is_this_net, net))
+	if (l_queue_find(nets, simple_match, net))
 		return false;
 
 	l_queue_push_head(nets, net);
@@ -3010,6 +2799,8 @@ bool mesh_net_attach(struct mesh_net *net, struct mesh_io *io)
 
 struct mesh_io *mesh_net_detach(struct mesh_net *net)
 {
+	uint8_t snb[] = {MESH_AD_TYPE_BEACON, 0x01};
+	uint8_t pkt[] = {MESH_AD_TYPE_NETWORK};
 	struct mesh_io *io;
 	uint8_t type = 0;
 
@@ -3019,8 +2810,8 @@ struct mesh_io *mesh_net_detach(struct mesh_net *net)
 	io = net->io;
 
 	mesh_io_send_cancel(net->io, &type, 1);
-	mesh_io_deregister_recv_cb(io, MESH_IO_FILTER_BEACON);
-	mesh_io_deregister_recv_cb(io, MESH_IO_FILTER_NET);
+	mesh_io_deregister_recv_cb(io, snb, sizeof(snb));
+	mesh_io_deregister_recv_cb(io, pkt, sizeof(pkt));
 
 	net->io = NULL;
 	l_queue_remove(nets, net);
@@ -3033,8 +2824,9 @@ bool mesh_net_iv_index_update(struct mesh_net *net)
 	if (net->iv_upd_state != IV_UPD_NORMAL)
 		return false;
 
-	l_info("iv_upd_state = IV_UPD_UPDATING");
-	mesh_net_flush_msg_queues(net);
+	l_debug("iv_upd_state = IV_UPD_UPDATING");
+	l_queue_clear(net->msg_cache, l_free);
+
 	if (!mesh_config_write_iv_index(node_config_get(net->node),
 						net->iv_index + 1, true))
 		return false;
@@ -3042,7 +2834,8 @@ bool mesh_net_iv_index_update(struct mesh_net *net)
 	net->iv_upd_state = IV_UPD_UPDATING;
 	net->iv_index++;
 	net->iv_update = true;
-	l_queue_foreach(net->subnets, set_network_beacon, net);
+	l_queue_foreach(net->subnets, refresh_beacon, net);
+	queue_friend_update(net);
 	net->iv_update_timeout = l_timeout_create(
 			IV_IDX_UPD_MIN,
 			iv_upd_to, net, NULL);
@@ -3050,61 +2843,6 @@ bool mesh_net_iv_index_update(struct mesh_net *net)
 	return true;
 }
 
-
-
-void mesh_net_sub_list_add(struct mesh_net *net, uint16_t addr)
-{
-	uint8_t msg[11] = { PROXY_OP_FILTER_ADD };
-	uint8_t n = 1;
-
-	l_put_be16(addr, msg + n);
-	n += 2;
-
-	mesh_net_transport_send(net, 0, false,
-			mesh_net_get_iv_index(net), 0,
-			0, 0, 0, msg, n);
-}
-
-void mesh_net_sub_list_del(struct mesh_net *net, uint16_t addr)
-{
-	uint8_t msg[11] = { PROXY_OP_FILTER_DEL };
-	uint8_t n = 1;
-
-	l_put_be16(addr, msg + n);
-	n += 2;
-
-	mesh_net_transport_send(net, 0, false,
-			mesh_net_get_iv_index(net), 0,
-			0, 0, 0, msg, n);
-}
-
-/* TODO: change to use net index */
-bool mesh_net_set_friend(struct mesh_net *net, uint16_t friend_addr)
-{
-	if (!net)
-		return false;
-
-	net->bea_id = 0;
-
-	l_info("Set Frnd addr: %4.4x", friend_addr);
-	if (!friend_addr)
-		trigger_heartbeat(net, FEATURE_LPN, false);
-	else
-		trigger_heartbeat(net, FEATURE_LPN, true);
-
-	net->friend_addr = friend_addr;
-
-	set_network_beacon(get_primary_subnet(net), net);
-	return true;
-}
-
-uint16_t mesh_net_get_friend(struct mesh_net *net)
-{
-	if (!net)
-		return 0;
-
-	return net->friend_addr;
-}
 
 bool mesh_net_dst_reg(struct mesh_net *net, uint16_t dst)
 {
@@ -3121,14 +2859,6 @@ bool mesh_net_dst_reg(struct mesh_net *net, uint16_t dst)
 			l_queue_push_head(net->destinations, dest);
 		else
 			l_queue_push_tail(net->destinations, dest);
-
-		/* If LPN, and Group/Virtual, add to Subscription List */
-		if (net->friend_addr) {
-			/* TODO: Fix this garbage */
-			uint32_t u32_dst[7] = {dst, 0xffffffff};
-
-			frnd_sub_add(net, u32_dst);
-		}
 	}
 
 	dest->dst = dst;
@@ -3151,47 +2881,34 @@ bool mesh_net_dst_unreg(struct mesh_net *net, uint16_t dst)
 	if (dest->ref_cnt)
 		return true;
 
-	/* TODO: If LPN, and Group/Virtual, remove from Subscription List */
-	if (net->friend_addr) {
-		/* TODO: Fix this garbage */
-		uint32_t u32_dst[7] = {dst, 0xffffffff};
-
-		frnd_sub_del(net, u32_dst);
-	}
-
 	l_queue_remove(net->destinations, dest);
 
 	l_free(dest);
 	return true;
 }
 
-bool mesh_net_flush(struct mesh_net *net)
-{
-	if (!net)
-		return false;
-
-	/* TODO mesh-io Flush */
-	return true;
-}
-
-/* TODO: add net key index */
 static bool send_seg(struct mesh_net *net, struct mesh_sar *msg, uint8_t segO)
 {
+	struct mesh_subnet *subnet;
 	uint8_t seg_len;
 	uint8_t gatt_data[30];
 	uint8_t *packet = gatt_data;
 	uint8_t packet_len;
-	uint8_t segN = SEG_MAX(msg->len);
+	uint8_t segN = SEG_MAX(msg->segmented, msg->len);
 	uint16_t seg_off = SEG_OFF(segO);
-	uint32_t key_id = 0;
-	uint32_t seq_num = mesh_net_next_seq_num(net);
+	uint32_t seq_num;
 
-	if (segN) {
+	if (msg->segmented) {
+		/* Send each segment on unique seq_num */
+		seq_num = mesh_net_next_seq_num(net);
+
 		if (msg->len - seg_off > SEG_OFF(1))
 			seg_len = SEG_OFF(1);
 		else
 			seg_len = msg->len - seg_off;
 	} else {
+		/* Send on same seq_num used for Access Layer */
+		seq_num = msg->seqAuth;
 		seg_len = msg->len;
 	}
 
@@ -3200,53 +2917,32 @@ static bool send_seg(struct mesh_net *net, struct mesh_sar *msg, uint8_t segO)
 		mesh_net_iv_index_update(net);
 
 	l_debug("segN %d segment %d seg_off %d", segN, segO, seg_off);
-	/* print_packet("Sending", msg->buf + seg_off, seg_len); */
-	{
-		/* TODO: Are we RXing on an LPN's behalf? Then set RLY bit */
 
-		if (!mesh_crypto_packet_build(false, msg->ttl,
-					seq_num,
-					msg->src, msg->remote,
-					0,
-					segN ? true : false, msg->key_aid,
-					msg->szmic, false, msg->seqZero,
-					segO, segN,
+	/* TODO: Are we RXing on an LPN's behalf? Then set RLY bit */
+	if (!mesh_crypto_packet_build(false, msg->ttl, seq_num, msg->src,
+					msg->remote, 0, msg->segmented,
+					msg->key_aid, msg->szmic, false,
+					msg->seqZero, segO, segN,
 					msg->buf + seg_off, seg_len,
 					packet + 1, &packet_len)) {
-			l_error("Failed to build packet");
-			return false;
-		}
+		l_error("Failed to build packet");
+		return false;
 	}
+
 	print_packet("Clr-Net Tx", packet + 1, packet_len);
 
-	if (msg->frnd_cred && net->friend_addr)
-		key_id = frnd_get_key(net);
+	subnet = l_queue_find(net->subnets, match_key_index,
+						L_UINT_TO_PTR(msg->net_idx));
+	if (!subnet)
+		return false;
 
-	if (!key_id) {
-		struct mesh_subnet *subnet = get_primary_subnet(net);
-
-		key_id = subnet->net_key_tx;
-	}
-
-	if (!net_key_encrypt(key_id, msg->iv_index, packet + 1, packet_len)) {
+	if (!net_key_encrypt(subnet->net_key_tx, msg->iv_index, packet + 1,
+								packet_len)) {
 		l_error("Failed to encode packet");
 		return false;
 	}
 
-	/* print_packet("Step 4", packet + 1, packet_len); */
-
-	{
-		char *str;
-
-		send_msg_pkt(net, packet, packet_len + 1);
-
-		str = l_util_hexstring(packet + 1, packet_len);
-		l_info("TX: Network %04x -> %04x : %s (%u) : TTL %d : SEQ %06x",
-				msg->src, msg->remote, str,
-				packet_len, msg->ttl,
-				msg->frnd ? msg->seqAuth + segO : seq_num);
-		l_free(str);
-	}
+	send_msg_pkt(net, packet, packet_len + 1);
 
 	msg->last_seg = segO;
 
@@ -3254,14 +2950,10 @@ static bool send_seg(struct mesh_net *net, struct mesh_sar *msg, uint8_t segO)
 }
 
 void mesh_net_send_seg(struct mesh_net *net, uint32_t net_key_id,
-				uint32_t iv_index,
-				uint8_t ttl,
-				uint32_t seq,
-				uint16_t src, uint16_t dst,
-				uint32_t hdr,
-				const void *seg, uint16_t seg_len)
+			uint32_t iv_index, uint8_t ttl, uint32_t seq,
+			uint16_t src, uint16_t dst, uint32_t hdr,
+			const void *seg, uint16_t seg_len)
 {
-	char *str;
 	uint8_t packet[30];
 	uint8_t packet_len;
 	bool segmented = !!((hdr >> SEG_HDR_SHIFT) & true);
@@ -3277,15 +2969,10 @@ void mesh_net_send_seg(struct mesh_net *net, uint32_t net_key_id,
 	l_debug("SEQ0: %6.6x", seq);
 	l_debug("segO: %d", segO);
 
-	if (!mesh_crypto_packet_build(false, ttl,
-				seq,
-				src, dst,
-				0,
-				segmented, app_key_id,
-				szmic, false, seqZero,
-				segO, segN,
-				seg, seg_len,
-				packet + 1, &packet_len)) {
+	if (!mesh_crypto_packet_build(false, ttl, seq, src, dst, 0,
+					segmented, app_key_id, szmic, false,
+					seqZero, segO, segN, seg, seg_len,
+					packet + 1, &packet_len)) {
 		l_error("Failed to build packet");
 		return;
 	}
@@ -3295,22 +2982,19 @@ void mesh_net_send_seg(struct mesh_net *net, uint32_t net_key_id,
 		return;
 	}
 
-	/* print_packet("Step 4", packet + 1, packet_len); */
-
 	send_msg_pkt(net, packet, packet_len + 1);
 
-	str = l_util_hexstring(packet + 1, packet_len);
-	l_info("TX: Friend Seg-%d %04x -> %04x : %s (%u) : TTL %d : SEQ %06x",
-			segO, src, dst, str, packet_len, ttl, seq);
-	l_free(str);
+	l_debug("TX: Friend Seg-%d %04x -> %04x : len %u) : TTL %d : SEQ %06x",
+					segO, src, dst, packet_len, ttl, seq);
+
+	print_packet("TX: Friend", packet + 1, packet_len);
 }
 
 bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 				uint16_t dst, uint8_t key_aid, uint16_t net_idx,
 				uint8_t ttl, uint32_t seq, uint32_t iv_index,
-				bool szmic, const void *msg, uint16_t msg_len,
-				mesh_net_status_func_t status_func,
-				void *user_data)
+				bool segmented, bool szmic,
+				const void *msg, uint16_t msg_len)
 {
 	struct mesh_sar *payload = NULL;
 	uint8_t seg, seg_max;
@@ -3328,34 +3012,23 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	if (ttl == DEFAULT_TTL)
 		ttl = net->default_ttl;
 
-	seg_max = SEG_MAX(msg_len);
+	/* Long and sizmic messages *require* segmenting */
+	segmented |= szmic;
+	seg_max = SEG_MAX(segmented, msg_len);
+	segmented |= !!(seg_max);
 
 	/* First enqueue to any Friends and internal models */
-	result = msg_rxed(net, false, iv_index, ttl,
-				seq + seg_max,
-				net_idx,
-				src, dst,
-				key_aid,
-				szmic, seq & SEQ_ZERO_MASK,
+	result = msg_rxed(net, false, iv_index, ttl, seq, net_idx, src, dst,
+				key_aid, segmented, szmic, seq & SEQ_ZERO_MASK,
 				msg, msg_len);
 
-	/* If addressed to a unicast address and successfully enqueued,
+	/*
+	 * If addressed to a unicast address and successfully enqueued,
 	 * or delivered to one of our Unicast addresses we are done
 	 */
 	if ((result && IS_UNICAST(dst)) || src == dst ||
-			(dst >= net->src_addr && dst <= net->last_addr)) {
-		/* Adjust our seq_num for "virtual" delivery */
-		net->seq_num += seg_max;
-		mesh_net_next_seq_num(net);
+			(dst >= net->src_addr && dst <= net->last_addr))
 		return true;
-	}
-
-	/* If Segmented, Cancel any OB segmented message to same DST */
-	if (seg_max) {
-		payload = l_queue_remove_if(net->sar_out, match_sar_remote,
-							L_UINT_TO_PTR(dst));
-		mesh_sar_free(payload);
-	}
 
 	/* Setup OTA Network send */
 	payload = mesh_sar_new(msg_len);
@@ -3367,16 +3040,31 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	payload->szmic = szmic;
 	payload->frnd_cred = frnd_cred;
 	payload->key_aid = key_aid;
-	if (seg_max) {
+	payload->net_idx = net_idx;
+	payload->iv_index = mesh_net_get_iv_index(net);
+	payload->seqAuth = seq;
+	payload->segmented = segmented;
+
+	if (segmented) {
 		payload->flags = 0xffffffff >> (31 - seg_max);
 		payload->seqZero = seq & SEQ_ZERO_MASK;
+		payload->id = ++net->sar_id_next;
+
+		/* Single thread SAR messages to same Unicast DST */
+		if (l_queue_find(net->sar_out, match_sar_remote,
+							L_UINT_TO_PTR(dst))) {
+			/* Delay sending Outbound SAR unless prior
+			 * SAR to same DST has completed */
+
+			l_debug("OB-Queued SeqZero: %4.4x", payload->seqZero);
+			l_queue_push_tail(net->sar_queue, payload);
+			return true;
+		}
 	}
 
-	payload->iv_index = mesh_net_get_iv_index(net);
-	payload->seqAuth = net->seq_num;
-
 	result = true;
-	if (!IS_UNICAST(dst) && seg_max) {
+
+	if (!IS_UNICAST(dst) && segmented) {
 		int i;
 
 		for (i = 0; i < 4; i++) {
@@ -3389,14 +3077,12 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	}
 
 	/* Reliable: Cache; Unreliable: Flush*/
-	if (result && seg_max && IS_UNICAST(dst)) {
+	if (result && segmented && IS_UNICAST(dst)) {
 		l_queue_push_head(net->sar_out, payload);
 		payload->seg_timeout =
 			l_timeout_create(SEG_TO, outseg_to, net, NULL);
 		payload->msg_timeout =
 			l_timeout_create(MSG_TO, outmsg_to, net, NULL);
-		payload->status_func = status_func;
-		payload->user_data = user_data;
 		payload->id = ++net->sar_id_next;
 	} else
 		mesh_sar_free(payload);
@@ -3404,37 +3090,27 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	return result;
 }
 
-void mesh_net_ack_send(struct mesh_net *net, uint32_t key_id,
-				uint32_t iv_index,
-				uint8_t ttl,
-				uint32_t seq,
-				uint16_t src, uint16_t dst,
-				bool rly, uint16_t seqZero,
-				uint32_t ack_flags)
+void mesh_net_ack_send(struct mesh_net *net, uint32_t key_id, uint32_t iv_index,
+			uint8_t ttl, uint32_t seq, uint16_t src, uint16_t dst,
+			bool rly, uint16_t seqZero, uint32_t ack_flags)
 {
 	uint32_t hdr;
 	uint8_t data[7];
 	uint8_t pkt_len;
 	uint8_t pkt[30];
-	char *str;
 
 	hdr = NET_OP_SEG_ACKNOWLEDGE << OPCODE_HDR_SHIFT;
 	hdr |= rly << RELAY_HDR_SHIFT;
 	hdr |= (seqZero & SEQ_ZERO_MASK) << SEQ_ZERO_HDR_SHIFT;
 	l_put_be32(hdr, data);
 	l_put_be32(ack_flags, data + 3);
-	if (!mesh_crypto_packet_build(true, ttl,
-					seq,
-					src, dst,
-					NET_OP_SEG_ACKNOWLEDGE,
-					false, /* Not Segmented */
-					0,	/* No Key ID associated */
-					false, rly, seqZero,
-					0, 0,	/* no segO or segN */
-					data + 1, 6,
-					pkt + 1, &pkt_len)) {
+
+	/* Not Segmented, no Key ID associated, no segO or segN */
+	if (!mesh_crypto_packet_build(true, ttl, seq, src, dst,
+					NET_OP_SEG_ACKNOWLEDGE, false, 0, false,
+					rly, seqZero, 0, 0, data + 1, 6,
+					pkt + 1, &pkt_len))
 		return;
-	}
 
 	if (!key_id) {
 		struct mesh_subnet *subnet = get_primary_subnet(net);
@@ -3447,21 +3123,18 @@ void mesh_net_ack_send(struct mesh_net *net, uint32_t key_id,
 		return;
 	}
 
-	/* print_packet("Step 4", pkt, pkt_len); */
 	send_msg_pkt(net, pkt, pkt_len + 1);
 
-	str = l_util_hexstring(pkt + 1, pkt_len);
-	l_info("TX: Friend ACK %04x -> %04x : %s (%u) : TTL %d : SEQ %06x",
-			src, dst, str, pkt_len,
-			ttl, seq);
-	l_free(str);
+	l_debug("TX: Friend ACK %04x -> %04x : len %u : TTL %d : SEQ %06x",
+					src, dst, pkt_len, ttl, seq);
+	print_packet("TX: Friend ACK", pkt + 1, pkt_len);
 }
 
-/* TODO: add net key index */
 void mesh_net_transport_send(struct mesh_net *net, uint32_t key_id,
-				bool fast, uint32_t iv_index, uint8_t ttl,
-				uint32_t seq, uint16_t src, uint16_t dst,
-				const uint8_t *msg, uint16_t msg_len)
+				uint16_t net_idx, uint32_t iv_index,
+				uint8_t ttl, uint32_t seq, uint16_t src,
+				uint16_t dst, const uint8_t *msg,
+				uint16_t msg_len)
 {
 	uint32_t use_seq = seq;
 	uint8_t pkt_len;
@@ -3489,27 +3162,23 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t key_id,
 		uint32_t hdr = msg[0] << OPCODE_HDR_SHIFT;
 		uint8_t frnd_ttl = ttl;
 
-		if (friend_packet_queue(net, iv_index,
-					true, frnd_ttl,
-					mesh_net_next_seq_num(net),
-					src, dst,
-					hdr,
-					msg + 1, msg_len - 1)) {
+		if (friend_packet_queue(net, iv_index, true, frnd_ttl,
+					mesh_net_next_seq_num(net), src, dst,
+					hdr, msg + 1, msg_len - 1))
 			return;
-		}
 	}
 
 	/* Deliver to Local entities if applicable */
-	if (!(dst & 0x8000) && src >= net->src_addr && src <= net->last_addr) {
-		result = ctl_received(net, !!(key_id),
-					iv_index, ttl,
-					mesh_net_next_seq_num(net),
-					src, dst,
+	if (!(dst & 0x8000) && src >= net->src_addr && src <= net->last_addr)
+		result = ctl_received(net, key_id, iv_index, ttl,
+					mesh_net_next_seq_num(net), src, dst,
 					msg[0], 0, msg + 1, msg_len - 1);
-	}
 
 	if (!key_id) {
-		struct mesh_subnet *subnet = get_primary_subnet(net);
+		struct mesh_subnet *subnet = l_queue_find(net->subnets,
+				match_key_index, L_UINT_TO_PTR(net_idx));
+		if (!subnet)
+			return;
 
 		key_id = subnet->net_key_tx;
 		use_seq = mesh_net_next_seq_num(net);
@@ -3518,37 +3187,18 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t key_id,
 			return;
 	}
 
-	if (!mesh_crypto_packet_build(true, ttl,
-				use_seq,
-				src, dst,
-				msg[0],
-				false, 0,
-				false, false, 0,
-				0, 0,
-				msg + 1, msg_len - 1,
-				pkt + 1, &pkt_len))
+	if (!mesh_crypto_packet_build(true, ttl, use_seq, src, dst, msg[0],
+				false, 0, false, false, 0, 0, 0, msg + 1,
+				msg_len - 1, pkt + 1, &pkt_len))
 		return;
-
-	/* print_packet("Step 2", pkt + 1, pkt_len); */
 
 	if (!net_key_encrypt(key_id, iv_index, pkt + 1, pkt_len)) {
 		l_error("Failed to encode packet");
 		return;
 	}
 
-	/* print_packet("Step 4", pkt + 1, pkt_len); */
-
-	if (dst != 0) {
-		char *str;
-
+	if (dst != 0)
 		send_msg_pkt(net, pkt, pkt_len + 1);
-
-		str = l_util_hexstring(pkt + 1, pkt_len);
-		l_info("TX: Network %04x -> %04x : %s (%u) : TTL %d : SEQ %06x",
-				src, dst, str, pkt_len,
-				ttl, use_seq);
-		l_free(str);
-	}
 }
 
 uint8_t mesh_net_key_refresh_phase_set(struct mesh_net *net, uint16_t idx,
@@ -3634,7 +3284,7 @@ int mesh_net_update_key(struct mesh_net *net, uint16_t idx,
 
 	if (subnet->net_key_upd) {
 		net_key_unref(subnet->net_key_upd);
-		l_info("Warning: overwriting new keys");
+		l_debug("Warning: overwriting new keys");
 	}
 
 	/* Preserve starting data */
@@ -3645,15 +3295,11 @@ int mesh_net_update_key(struct mesh_net *net, uint16_t idx,
 		return MESH_STATUS_CANNOT_UPDATE;
 	}
 
-	/* If we are an LPN, generate our keys here */
-	if (net->friend_addr)
-		frnd_key_refresh(net, 1);
-	else
-		/* If we are a Friend-Node, generate all our new keys */
-		l_queue_foreach(net->friends, frnd_kr_phase1,
+	/* If we are a Friend-Node, generate all our new keys */
+	l_queue_foreach(net->friends, frnd_kr_phase1,
 					L_UINT_TO_PTR(subnet->net_key_upd));
 
-	l_info("key refresh phase 1: Key ID %d", subnet->net_key_upd);
+	l_debug("key refresh phase 1: Key ID %d", subnet->net_key_upd);
 
 	if (!mesh_config_net_key_update(node_config_get(net->node), idx, value))
 		return MESH_STATUS_STORAGE_FAIL;
@@ -3663,7 +3309,7 @@ int mesh_net_update_key(struct mesh_net *net, uint16_t idx,
 	return MESH_STATUS_SUCCESS;
 }
 
-uint16_t mesh_net_get_features(struct mesh_net *net)
+static uint16_t get_features(struct mesh_net *net)
 {
 	uint16_t features = 0;
 
@@ -3671,10 +3317,8 @@ uint16_t mesh_net_get_features(struct mesh_net *net)
 		features |= FEATURE_RELAY;
 	if (net->proxy_enable)
 		features |= FEATURE_PROXY;
-	if (!l_queue_isempty(net->friends))
+	if (net->friend_enable)
 		features |= FEATURE_FRIEND;
-	if (net->friend_addr != UNASSIGNED_ADDRESS)
-		features |= FEATURE_LPN;
 
 	return features;
 }
@@ -3698,8 +3342,8 @@ void mesh_net_heartbeat_send(struct mesh_net *net)
 	l_put_be16(hb->features, msg + n);
 	n += 2;
 
-	mesh_net_transport_send(net, 0, false, mesh_net_get_iv_index(net),
-				hb->pub_ttl, 0, 0, hb->pub_dst, msg, n);
+	mesh_net_transport_send(net, 0, 0, mesh_net_get_iv_index(net),
+					hb->pub_ttl, 0, 0, hb->pub_dst, msg, n);
 }
 
 void mesh_net_heartbeat_init(struct mesh_net *net)
@@ -3708,36 +3352,13 @@ void mesh_net_heartbeat_init(struct mesh_net *net)
 
 	memset(hb, 0, sizeof(struct mesh_net_heartbeat));
 	hb->sub_min_hops = 0xff;
-	hb->features = mesh_net_get_features(net);
-}
-
-void mesh_net_uni_range_set(struct mesh_net *net,
-				struct mesh_net_addr_range *range)
-{
-	net->prov_uni_addr.low = range->low;
-	net->prov_uni_addr.high = range->high;
-	net->prov_uni_addr.next = range->next;
-}
-
-struct mesh_net_addr_range mesh_net_uni_range_get(struct mesh_net *net)
-{
-	return net->prov_uni_addr;
+	hb->features = get_features(net);
 }
 
 void mesh_net_set_iv_index(struct mesh_net *net, uint32_t index, bool update)
 {
 	net->iv_index = index;
 	net->iv_update = update;
-}
-
-void mesh_net_provisioner_mode_set(struct mesh_net *net, bool mode)
-{
-	net->provisioner = mode;
-}
-
-bool mesh_net_provisioner_mode_get(struct mesh_net *net)
-{
-	return net->provisioner;
 }
 
 uint16_t mesh_net_get_primary_idx(struct mesh_net *net)
@@ -3757,12 +3378,28 @@ uint16_t mesh_net_get_primary_idx(struct mesh_net *net)
 uint32_t mesh_net_friend_timeout(struct mesh_net *net, uint16_t addr)
 {
 	struct mesh_friend *frnd = l_queue_find(net->friends, match_by_friend,
-						L_UINT_TO_PTR(addr));
+							L_UINT_TO_PTR(addr));
 
 	if (!frnd)
 		return 0;
 	else
 		return frnd->poll_timeout;
+}
+
+struct l_queue *mesh_net_get_friends(struct mesh_net *net)
+{
+	if (net)
+		return net->friends;
+
+	return NULL;
+}
+
+struct l_queue *mesh_net_get_negotiations(struct mesh_net *net)
+{
+	if (net)
+		return net->negotiations;
+
+	return NULL;
 }
 
 struct mesh_node *mesh_net_node_get(struct mesh_net *net)
@@ -3799,14 +3436,6 @@ bool mesh_net_is_local_address(struct mesh_net *net, uint16_t src,
 
 	return (src >= net->src_addr && src <= net->last_addr) &&
 			(last >= net->src_addr && last <= net->last_addr);
-}
-
-void mesh_net_set_window_accuracy(struct mesh_net *net, uint8_t accuracy)
-{
-	if (!net)
-		return;
-
-	net->window_accuracy = accuracy;
 }
 
 void mesh_net_transmit_params_set(struct mesh_net *net, uint8_t count,
@@ -3853,7 +3482,112 @@ void mesh_net_set_prov(struct mesh_net *net, struct mesh_prov *prov)
 	net->prov = prov;
 }
 
+static void refresh_instant(void *a, void *b)
+{
+	struct mesh_subnet *subnet = a;
+	struct mesh_net *net = b;
+	uint32_t instant = net_key_beacon_last_seen(subnet->net_key_tx);
+
+	if (net->instant < instant)
+		net->instant = instant;
+}
+
 uint32_t mesh_net_get_instant(struct mesh_net *net)
 {
+	if (!net)
+		return 0;
+
+	l_queue_foreach(net->subnets, refresh_instant, net);
+
 	return net->instant;
+}
+
+static bool match_replay_cache(const void *a, const void *b)
+{
+	const struct mesh_rpl *rpe = a;
+	uint16_t src = L_PTR_TO_UINT(b);
+
+	return src == rpe->src;
+}
+
+static bool clean_old_iv_index(void *a, void *b)
+{
+	struct mesh_rpl *rpe = a;
+	uint32_t iv_index = L_PTR_TO_UINT(b);
+
+	if (iv_index < 2)
+		return false;
+
+	if (rpe->iv_index < iv_index - 1) {
+		l_free(rpe);
+		return true;
+	}
+
+	return false;
+}
+
+bool net_msg_check_replay_cache(struct mesh_net *net, uint16_t src,
+				uint16_t crpl, uint32_t seq, uint32_t iv_index)
+{
+	struct mesh_rpl *rpe;
+
+	/* If anything missing reject this message by returning true */
+	if (!net || !net->node)
+		return true;
+
+	if (!net->replay_cache) {
+		net->replay_cache = l_queue_new();
+		rpl_init(net->node, net->iv_index);
+		rpl_get_list(net->node, net->replay_cache);
+	}
+
+	rpe = l_queue_find(net->replay_cache, match_replay_cache,
+						L_UINT_TO_PTR(src));
+
+	if (rpe) {
+		if (iv_index > rpe->iv_index)
+			return false;
+
+		/* Return true if (iv_index | seq) too low */
+		if (iv_index < rpe->iv_index || seq <= rpe->seq) {
+			l_debug("Ignoring replayed packet");
+			return true;
+		}
+	}
+
+	/* SRC not in Replay Cache... see if there is space for it */
+	else if (l_queue_length(net->replay_cache) >= crpl) {
+		int ret = l_queue_foreach_remove(net->replay_cache,
+				clean_old_iv_index, L_UINT_TO_PTR(iv_index));
+
+		/* Return true if no space could be freed */
+		if (!ret)
+			return true;
+	}
+
+	return false;
+}
+
+void net_msg_add_replay_cache(struct mesh_net *net, uint16_t src, uint32_t seq,
+							uint32_t iv_index)
+{
+	struct mesh_rpl *rpe;
+
+	if (!net || !net->replay_cache)
+		return;
+
+	rpe = l_queue_remove_if(net->replay_cache, match_replay_cache,
+						L_UINT_TO_PTR(src));
+
+	if (!rpe) {
+		rpe = l_new(struct mesh_rpl, 1);
+		rpe->src = src;
+	}
+
+	rpe->seq = seq;
+	rpe->iv_index = iv_index;
+	rpl_put_entry(net->node, src, iv_index, seq);
+
+	/* Optimize so that most recent conversations stay earliest in cache */
+	l_queue_push_head(net->replay_cache, rpe);
 }

@@ -109,6 +109,9 @@
 #define APP_IDX_DEV_REMOTE	0x6fff
 #define APP_IDX_DEV_LOCAL	0x7fff
 
+#define DEFAULT_SEQUENCE_NUMBER 0x000000
+#define SEQ_MASK		0xffffff
+
 #define IS_UNASSIGNED(x)	((x) == UNASSIGNED_ADDRESS)
 #define IS_UNICAST(x)		(((x) > UNASSIGNED_ADDRESS) && \
 					((x) < VIRTUAL_ADDRESS_LOW))

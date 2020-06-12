@@ -40,7 +40,8 @@ typedef enum {
 	MESH_AGENT_REQUEST_IN_ALPHA,
 	MESH_AGENT_REQUEST_STATIC_OOB,
 	MESH_AGENT_REQUEST_PRIVATE_KEY,
-	MESH_AGENT_REQUEST_PUBLIC_KEY
+	MESH_AGENT_REQUEST_PUBLIC_KEY,
+	MESH_AGENT_REQUEST_CAPABILITIES,
 } agent_request_type_t;
 
 struct agent_request {
@@ -131,9 +132,9 @@ static void parse_prov_caps(struct mesh_agent_prov_caps *caps,
 			break;
 		}
 
-		if (!strcmp(str, "PublicOOB"))
+		if (!strcmp(str, "public-oob"))
 			caps->pub_type = 1;
-		else if (!strcmp(str, "StaticOOB"))
+		else if (!strcmp(str, "static-oob"))
 			caps->static_type = 1;
 	}
 
@@ -158,6 +159,27 @@ static void parse_oob_info(struct mesh_agent_prov_caps *caps,
 	}
 }
 
+static void parse_properties(struct mesh_agent *agent,
+					struct l_dbus_message_iter *properties)
+{
+	const char *key, *uri_string;
+	struct l_dbus_message_iter variant;
+
+	memset(&agent->caps, 0, sizeof(agent->caps));
+
+	while (l_dbus_message_iter_next_entry(properties, &key, &variant)) {
+		if (!strcmp(key, "Capabilities")) {
+			parse_prov_caps(&agent->caps, &variant);
+		} else if (!strcmp(key, "URI")) {
+			l_dbus_message_iter_get_variant(&variant, "s",
+								&uri_string);
+			/* TODO: compute hash */
+		} else if (!strcmp(key, "OutOfBandInfo")) {
+			parse_oob_info(&agent->caps, &variant);
+		}
+	}
+}
+
 static void agent_free(void *agent_data)
 {
 	struct mesh_agent *agent = agent_data;
@@ -165,9 +187,6 @@ static void agent_free(void *agent_data)
 	mesh_agent_cb_t simple_cb;
 	mesh_agent_key_cb_t key_cb;
 	mesh_agent_number_cb_t number_cb;
-
-	if (!l_queue_find(agents, simple_match, agent))
-		return;
 
 	err = MESH_ERROR_DOES_NOT_EXIST;
 
@@ -193,6 +212,7 @@ static void agent_free(void *agent_data)
 		case MESH_AGENT_REQUEST_VIBRATE:
 		case MESH_AGENT_REQUEST_OUT_NUMERIC:
 		case MESH_AGENT_REQUEST_OUT_ALPHA:
+		case MESH_AGENT_REQUEST_CAPABILITIES:
 			simple_cb = agent->req->cb;
 			simple_cb(req->user_data, err);
 		default:
@@ -205,15 +225,16 @@ static void agent_free(void *agent_data)
 
 	l_free(agent->path);
 	l_free(agent->owner);
+	l_free(agent);
 }
 
 void mesh_agent_remove(struct mesh_agent *agent)
 {
-	if (!agent || !l_queue_find(agents, simple_match, agent))
+	if (!agent)
 		return;
 
-	agent_free(agent);
-	l_queue_remove(agents, agent);
+	if (l_queue_remove(agents, agent))
+		agent_free(agent);
 }
 
 void mesh_agent_cleanup(void)
@@ -222,6 +243,7 @@ void mesh_agent_cleanup(void)
 		return;
 
 	l_queue_destroy(agents, agent_free);
+	agents = NULL;
 
 }
 
@@ -235,25 +257,12 @@ struct mesh_agent *mesh_agent_create(const char *path, const char *owner,
 					struct l_dbus_message_iter *properties)
 {
 	struct mesh_agent *agent;
-	const char *key, *uri_string;
-	struct l_dbus_message_iter variant;
 
 	agent = l_new(struct mesh_agent, 1);
-
-	while (l_dbus_message_iter_next_entry(properties, &key, &variant)) {
-		if (!strcmp(key, "Capabilities")) {
-			parse_prov_caps(&agent->caps, &variant);
-		} else if (!strcmp(key, "URI")) {
-			l_dbus_message_iter_get_variant(&variant, "s",
-								&uri_string);
-			/* TODO: compute hash */
-		} else if (!strcmp(key, "OutOfBandInfo")) {
-			parse_oob_info(&agent->caps, &variant);
-		}
-	}
-
 	agent->owner = l_strdup(owner);
 	agent->path = l_strdup(path);
+
+	parse_properties(agent, properties);
 
 	l_queue_push_tail(agents, agent);
 
@@ -289,12 +298,74 @@ static int get_reply_error(struct l_dbus_message *reply)
 	if (l_dbus_message_is_error(reply)) {
 
 		l_dbus_message_get_error(reply, &name, &desc);
-		l_error("Agent failed output action (%s), %s", name, desc);
+		l_error("Agent failed (%s), %s", name, desc);
 		return MESH_ERROR_FAILED;
 	}
 
 	return MESH_ERROR_NONE;
 }
+
+static void properties_reply(struct l_dbus_message *reply, void *user_data)
+{
+	struct mesh_agent *agent = user_data;
+	struct agent_request *req;
+	mesh_agent_cb_t cb;
+	struct l_dbus_message_iter properties;
+	int err;
+
+	if (!l_queue_find(agents, simple_match, agent) || !agent->req)
+		return;
+
+	req = agent->req;
+
+	err = get_reply_error(reply);
+
+	if (err != MESH_ERROR_NONE)
+		goto fail;
+
+	if (!l_dbus_message_get_arguments(reply, "a{sv}", &properties)) {
+		err = MESH_ERROR_FAILED;
+		goto fail;
+	}
+
+	parse_properties(agent, &properties);
+fail:
+	if (req->cb) {
+		cb = req->cb;
+		cb(req->user_data, err);
+	}
+
+	l_dbus_message_unref(req->msg);
+	l_free(req);
+	agent->req = NULL;
+}
+
+void mesh_agent_refresh(struct mesh_agent *agent, mesh_agent_cb_t cb,
+							void *user_data)
+{
+	struct l_dbus *dbus = dbus_get_bus();
+	struct l_dbus_message *msg;
+	struct l_dbus_message_builder *builder;
+
+	agent->req = create_request(MESH_AGENT_REQUEST_CAPABILITIES, (void *)cb,
+								user_data);
+
+	msg = l_dbus_message_new_method_call(dbus, agent->owner, agent->path,
+						L_DBUS_INTERFACE_PROPERTIES,
+						"GetAll");
+
+	builder = l_dbus_message_builder_new(msg);
+	l_dbus_message_builder_append_basic(builder, 's',
+						MESH_PROVISION_AGENT_INTERFACE);
+	l_dbus_message_builder_finalize(builder);
+	l_dbus_message_builder_destroy(builder);
+
+	l_dbus_send_with_reply(dbus_get_bus(), msg, properties_reply, agent,
+									NULL);
+
+	agent->req->msg = l_dbus_message_ref(msg);
+}
+
 
 static void simple_reply(struct l_dbus_message *reply, void *user_data)
 {
@@ -363,7 +434,7 @@ static void key_reply(struct l_dbus_message *reply, void *user_data)
 	mesh_agent_key_cb_t cb;
 	struct l_dbus_message_iter iter_array;
 	uint32_t n = 0, expected_len = 0;
-	uint8_t buf[64];
+	uint8_t *buf;
 	int err;
 
 	if (!l_queue_find(agents, simple_match, agent) || !agent->req)
@@ -376,13 +447,13 @@ static void key_reply(struct l_dbus_message *reply, void *user_data)
 	if (err != MESH_ERROR_NONE)
 		goto done;
 
-	if (!l_dbus_message_get_arguments(reply, "au", &iter_array)) {
+	if (!l_dbus_message_get_arguments(reply, "ay", &iter_array)) {
 		l_error("Failed to retrieve key input");
 		err = MESH_ERROR_FAILED;
 		goto done;
 	}
 
-	if (!l_dbus_message_iter_get_fixed_array(&iter_array, buf, &n)) {
+	if (!l_dbus_message_iter_get_fixed_array(&iter_array, &buf, &n)) {
 		l_error("Failed to retrieve key input");
 		err = MESH_ERROR_FAILED;
 		goto done;
@@ -390,7 +461,7 @@ static void key_reply(struct l_dbus_message *reply, void *user_data)
 
 	if (req->type == MESH_AGENT_REQUEST_PRIVATE_KEY)
 		expected_len = 32;
-	else if (MESH_AGENT_REQUEST_PUBLIC_KEY)
+	else if (req->type == MESH_AGENT_REQUEST_PUBLIC_KEY)
 		expected_len = 64;
 	else
 		expected_len = 16;
@@ -402,12 +473,12 @@ static void key_reply(struct l_dbus_message *reply, void *user_data)
 	}
 
 done:
-	l_dbus_message_unref(req->msg);
-
 	if (req->cb) {
 		cb = req->cb;
 		cb(req->user_data, err, buf, n);
 	}
+
+	l_dbus_message_unref(req->msg);
 
 	l_free(req);
 	agent->req = NULL;
@@ -515,6 +586,8 @@ static int request_key(struct mesh_agent *agent,
 						MESH_PROVISION_AGENT_INTERFACE,
 						method_name);
 
+	l_dbus_message_set_arguments(msg, "");
+
 	l_debug("Send key request to %s %s", agent->owner, agent->path);
 
 	l_dbus_send_with_reply(dbus_get_bus(), msg, key_reply, agent, NULL);
@@ -601,11 +674,19 @@ int mesh_agent_prompt_number(struct mesh_agent *agent, bool initiator,
 	return prompt_input(agent, str_type, type, true, cb, user_data);
 }
 
-int mesh_agent_prompt_alpha(struct mesh_agent *agent, mesh_agent_key_cb_t cb,
-								void *user_data)
+int mesh_agent_prompt_alpha(struct mesh_agent *agent, bool initiator,
+					mesh_agent_key_cb_t cb, void *user_data)
 {
-	return prompt_input(agent, "in-alpha", MESH_AGENT_REQUEST_IN_ALPHA,
-							false, cb, user_data);
+	if (initiator)
+		return prompt_input(agent,
+				cap_table[MESH_AGENT_REQUEST_OUT_ALPHA].action,
+				MESH_AGENT_REQUEST_OUT_ALPHA, false, cb,
+				user_data);
+	else
+		return prompt_input(agent,
+				cap_table[MESH_AGENT_REQUEST_IN_ALPHA].action,
+				MESH_AGENT_REQUEST_IN_ALPHA, false, cb,
+				user_data);
 }
 
 int mesh_agent_request_static(struct mesh_agent *agent, mesh_agent_key_cb_t cb,
@@ -641,5 +722,8 @@ void mesh_agent_cancel(struct mesh_agent *agent)
 	msg = l_dbus_message_new_method_call(dbus, agent->owner, agent->path,
 						MESH_PROVISION_AGENT_INTERFACE,
 						"Cancel");
+
+	l_dbus_message_set_arguments(msg, "");
+
 	l_dbus_send(dbus, msg);
 }

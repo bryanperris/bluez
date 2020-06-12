@@ -8,13 +8,13 @@ Interface	org.bluez.mesh.Network1
 Object path	/org/bluez/mesh
 
 Methods:
-	void Join(object app_defined_root, array{byte}[16] uuid)
+	void Join(object app_root, array{byte}[16] uuid)
 
 		This is the first method that an application has to call to
 		become a provisioned node on a mesh network. The call will
 		initiate broadcasting of Unprovisioned Device Beacon.
 
-		The app_defined_root parameter is a D-Bus object root path of
+		The app_root parameter is a D-Bus object root path of
 		the application that implements org.bluez.mesh.Application1
 		interface. The application represents a node where child mesh
 		elements have their own objects that implement
@@ -22,12 +22,16 @@ Methods:
 		also contains a provision agent object that implements
 		org.bluez.mesh.ProvisionAgent1 interface. The standard
 		DBus.ObjectManager interface must be available on the
-		app_defined_root path.
+		app_root path.
 
 		The uuid parameter is a 16-byte array that contains Device UUID.
 		This UUID must be unique (at least from the daemon perspective),
 		therefore attempting to call this function using already
 		registered UUID results in an error.
+
+		When provisioning finishes, the daemon will call either
+		JoinComplete or JoinFailed method on object implementing
+		org.bluez.mesh.Application1 interface.
 
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments
@@ -39,18 +43,18 @@ Methods:
 		method.
 
 	object node, array{byte, array{(uint16, dict)}} configuration
-			Attach(object app_defined_root, uint64 token)
+			Attach(object app_root, uint64 token)
 
 		This is the first method that an application must call to get
 		access to mesh node functionalities.
 
-		The app_defined_root parameter is a D-Bus object root path of
+		The app_root parameter is a D-Bus object root path of
 		the application that implements org.bluez.mesh.Application1
 		interface. The application represents a node where child mesh
 		elements have their own objects that implement
 		org.bluez.mesh.Element1 interface. The standard
 		DBus.ObjectManager interface must be available on the
-		app_defined_root path.
+		app_root path.
 
 		The token parameter is a 64-bit number that has been assigned to
 		the application when it first got provisioned/joined mesh
@@ -100,10 +104,19 @@ Methods:
 					A 16-bit Company ID as defined by the
 					Bluetooth SIG
 
+				array{variant} Subscriptions
+
+					Addresses the model is subscribed to.
+
+					Each address is provided either as
+					uint16 for group addresses, or
+					as array{byte} for virtual labels.
+
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments
 			org.bluez.mesh.Error.NotFound,
 			org.bluez.mesh.Error.AlreadyExists,
+			org.bluez.mesh.Error.Busy,
 			org.bluez.mesh.Error.Failed
 
 	void Leave(uint64 token)
@@ -114,8 +127,10 @@ Methods:
 
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments
+			org.bluez.mesh.Error.NotFound
+			org.bluez.mesh.Error.Busy
 
-	uint64 token CreateNetwork(object app_root, array{byte}[16] uuid)
+	void CreateNetwork(object app_root, array{byte}[16] uuid)
 
 		This is the first method that an application calls to become
 		a Provisioner node, and a Configuration Client on a newly
@@ -136,22 +151,20 @@ Methods:
 		therefore attempting to call this function using already
 		registered UUID results in an error.
 
-		The returned token must be preserved by the application in
-		order to authenticate itself to the mesh daemon and attach to
-		the network as a mesh node by calling Attach() method or
-		permanently remove the identity of the mesh node by calling
-		Leave() method.
-
 		The other information the bluetooth-meshd daemon will preserve
 		about the initial node, is to give it the initial primary
 		unicast address (0x0001), and create and assign a net_key as the
 		primary network net_index (0x000).
 
+		Upon successful processing of Create() method, the daemon
+		will call JoinComplete method on object implementing
+		org.bluez.mesh.Application1.
+
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments
 			org.bluez.mesh.Error.AlreadyExists,
 
-	uint64 token Import(object app_root, array{byte}[16] uuid,
+	void Import(object app_root, array{byte}[16] uuid,
 				array{byte}[16] dev_key,
 				array{byte}[16] net_key, uint16 net_index,
 				dict flags, uint32 iv_index, uint16 unicast)
@@ -196,11 +209,9 @@ Methods:
 		The unicast parameter is the primary unicast address of the
 		imported node.
 
-		The returned token must be preserved by the application in
-		order to authenticate itself to the mesh daemon and attach to
-		the network as a mesh node by calling Attach() method or
-		permanently remove the identity of the mesh node by calling
-		Leave() method.
+		Upon successful processing of Import() method, the daemon will
+		call JoinComplete method on object implementing
+		org.bluez.mesh.Application1 interface.
 
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments,
@@ -214,7 +225,7 @@ Service		org.bluez.mesh
 Interface	org.bluez.mesh.Node1
 Object path	/org/bluez/mesh/node<uuid>
 		where <uuid> is the Device UUID passed to Join(),
-		CreateNetwork() or ImportLocalNode()
+		CreateNetwork() or Import()
 
 Methods:
 	void Send(object element_path, uint16 destination, uint16 key_index,
@@ -433,23 +444,34 @@ Properties:
 
 		This property contains unicast addresses of node's elements.
 
+	uint32 SequenceNumber [read-only]
+
+		This property may be read at any time to determine the
+		sequence number.
+
 Mesh Provisioning Hierarchy
 ============================
 Service		org.bluez.mesh
 Interface	org.bluez.mesh.Management1
 Object path	/org/bluez/mesh/node<uuid>
 		where <uuid> is the Device UUID passed to Join(),
-		CreateNetwork() or ImportLocalNode()
+		CreateNetwork() or Import()
 
 Methods:
-	void UnprovisionedScan(uint16 seconds)
+	void UnprovisionedScan(dict options)
 
 		This method is used by the application that supports
 		org.bluez.mesh.Provisioner1 interface to start listening
-		(scanning) for unprovisioned devices in the area. Scanning
-		will continue for the specified number of seconds, or, if 0 is
-		specified, then continuously until UnprovisionedScanCancel() is
-		called or if AddNode() method is called.
+		(scanning) for unprovisioned devices in the area.
+
+		The options parameter is a dictionary with the following keys
+		defined:
+
+		uint16 Seconds
+			Specifies number of seconds for scanning to be active.
+			If set to 0 or if this key is not present, then the
+			scanning will continue until UnprovisionedScanCancel()
+			or AddNode() methods are called.
 
 		Each time a unique unprovisioned beacon is heard, the
 		ScanResult() method on the app will be called with the result.
@@ -469,7 +491,7 @@ Methods:
 			org.bluez.mesh.Error.InvalidArguments
 			org.bluez.mesh.Error.NotAuthorized
 
-	void AddNode(array{byte}[16] uuid)
+	void AddNode(array{byte}[16] uuid, dict options)
 
 		This method is used by the application that supports
 		org.bluez.mesh.Provisioner1 interface to add the
@@ -477,6 +499,10 @@ Methods:
 
 		The uuid parameter is a 16-byte array that contains Device UUID
 		of the unprovisioned device to be added to the network.
+
+		The options parameter is a dictionary that may contain
+		additional configuration info (currently an empty placeholder
+		for forward compatibility).
 
 		PossibleErrors:
 			org.bluez.mesh.Error.InvalidArguments
@@ -631,7 +657,7 @@ Methods:
 			org.bluez.mesh.Error.Failed
 			org.bluez.mesh.Error.InvalidArguments
 			org.bluez.mesh.Error.DoesNotExist
-			org.bluez.mesh.Error.Busy
+			org.bluez.mesh.Error.InProgress
 
 	void DeleteAppKey(uint16 app_index)
 
@@ -693,30 +719,34 @@ Mesh Application Hierarchy
 ==========================
 Service		unique name
 Interface	org.bluez.mesh.Application1
-Object path	<app_defined_root>
+Object path	<app_root>
 
 An application is a collection of elements that host SIG defined and vendor
 specific models. It is expected that an application implements
-org.freedesktop.DBus.ObjectManager interface.
+org.freedesktop.DBus.ObjectManager interface at app_root path.
 
 An example mesh application hierarchy may look like this:
 
-		-> /com/example
-			|   - org.freedesktop.DBus.ObjectManager
-			|   - org.bluez.mesh.Application1
-			|   - org.bluez.mesh.Attention1 (optional)
-			|   - org.bluez.mesh.Provisioner1 (optional,Provisioner)
-			|
-			-> /com/example/agent
-			| |   - org.bluez.mesh.ProvisionAgent1
-			|
-			-> /com/example/ele00
-			| |   - org.bluez.mesh.Element1
-			-> /com/example/ele01
-			| |   - org.bluez.mesh.Element1
-			...
-			-> /com/example/elexx
-			| |   - org.bluez.mesh.Element1
+-> /com/example
+  |   - org.freedesktop.DBus.ObjectManager
+  |
+  -> /com/example/application
+  |   - org.bluez.mesh.Application1
+  |   - org.bluez.mesh.Attention1 (optional)
+  |   - org.bluez.mesh.Provisioner1 (optional,Provisioner)
+  |
+  -> /com/example/agent
+  |   - org.bluez.mesh.ProvisionAgent1
+  |
+  -> /com/example/ele00
+  |   - org.bluez.mesh.Element1
+  |
+  -> /com/example/ele01
+  |   - org.bluez.mesh.Element1
+  |
+  ...
+  -> /com/example/elexx
+      - org.bluez.mesh.Element1
 
 Methods:
 	void JoinComplete(uint64 token)
@@ -730,6 +760,10 @@ Methods:
 		the network as a mesh node by calling Attach() method or
 		permanently remove the identity of the mesh node by calling
 		Leave() method.
+
+		If this method returns an error, the daemon will assume that the
+		application failed to preserve the token, and will remove the
+		freshly created node.
 
 	void JoinFailed(string reason)
 
@@ -768,7 +802,7 @@ Object path	<app_defined_element_path>
 
 Methods:
 	void MessageReceived(uint16 source, uint16 key_index,
-					boolean subscription, array{byte} data)
+					variant destination, array{byte} data)
 
 		This method is called by bluetooth-meshd daemon when a message
 		arrives addressed to the application.
@@ -781,10 +815,17 @@ Methods:
 		be used by the application when sending a response to this
 		message (in case a response is expected).
 
-		The subscription parameter is a boolean that is set to true if
-		the message is received as a part of the subscription (i.e., the
-		destination is either a well known group address or a virtual
-		label.
+		The destination parameter contains the destination address of
+		received message. Underlying variant types are:
+
+		uint16
+
+			Destination is an unicast address, or a well known
+			group address
+
+		array{byte}
+
+			Destination is a virtual address label
 
 		The data parameter is the incoming message.
 
@@ -833,6 +874,13 @@ Methods:
 
 			A 16-bit Bluetooth-assigned Company Identifier of the
 			vendor as defined by Bluetooth SIG
+
+		array{variant} Subscriptions
+
+			Addresses the model is subscribed to.
+
+			Each address is provided either as uint16 for group
+			addresses, or as array{byte} for virtual labels.
 
 Properties:
 	uint8 Index [read-only]
@@ -896,7 +944,7 @@ Service		unique name
 Interface	org.bluez.mesh.Provisioner1
 Object path	freely definable
 
-	void ScanResult(int16 rssi, array{byte} data)
+	void ScanResult(int16 rssi, array{byte} data, dict options)
 
 		The method is called from the bluetooth-meshd daemon when a
 		unique UUID has been seen during UnprovisionedScan() for
@@ -907,10 +955,14 @@ Object path	freely definable
 
 		The data parameter is a variable length byte array, that may
 		have 1, 2 or 3 distinct fields contained in it including the 16
-		byte remote device UUID (always), a 32 bit mask of OOB
+		byte remote device UUID (always), a 16 bit mask of OOB
 		authentication flags (optional), and a 32 bit URI hash (if URI
 		bit set in OOB mask). Whether these fields exist or not is a
 		decision of the remote device.
+
+		The options parameter is a dictionary that may contain
+		additional scan result info (currently an empty placeholder for
+		forward compatibility).
 
 		If a beacon with a UUID that has already been reported is
 		recieved by the daemon, it will be silently discarded unless it

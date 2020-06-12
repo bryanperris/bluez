@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <ftw.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <limits.h>
 #include <time.h>
@@ -33,9 +34,14 @@
 
 #include "mesh/util.h"
 
+static bool debug_enabled;
+
 void print_packet(const char *label, const void *data, uint16_t size)
 {
 	struct timeval pkt_time;
+
+	if (!debug_enabled)
+		return;
 
 	gettimeofday(&pkt_time, NULL);
 
@@ -128,4 +134,34 @@ int create_dir(const char *dir_name)
 	mkdir(dir_name, 0755);
 
 	return 0;
+}
+
+static int del_fobject(const char *fpath, const struct stat *sb, int typeflag,
+						struct FTW *ftwbuf)
+{
+	switch (typeflag) {
+	case FTW_DP:
+		rmdir(fpath);
+		l_debug("RMDIR %s", fpath);
+		break;
+
+	case FTW_SL:
+	default:
+		remove(fpath);
+		l_debug("RM %s", fpath);
+		break;
+	}
+	return 0;
+}
+
+
+void del_path(const char *path)
+{
+	nftw(path, del_fobject, 5, FTW_DEPTH | FTW_PHYS);
+}
+
+void enable_debug(void)
+{
+	debug_enabled = true;
+	l_debug_enable("*");
 }

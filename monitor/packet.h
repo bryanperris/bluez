@@ -34,6 +34,7 @@
 #define PACKET_FILTER_SHOW_ACL_DATA	(1 << 4)
 #define PACKET_FILTER_SHOW_SCO_DATA	(1 << 5)
 #define PACKET_FILTER_SHOW_A2DP_STREAM	(1 << 6)
+#define PACKET_FILTER_SHOW_MGMT_SOCKET	(1 << 7)
 
 bool packet_has_filter(unsigned long filter);
 void packet_set_filter(unsigned long filter);
@@ -93,6 +94,8 @@ void packet_hci_event(struct timeval *tv, struct ucred *cred, uint16_t index,
 void packet_hci_acldata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size);
 void packet_hci_scodata(struct timeval *tv, struct ucred *cred, uint16_t index,
+				bool in, const void *data, uint16_t size);
+void packet_hci_isodata(struct timeval *tv, struct ucred *cred, uint16_t index,
 				bool in, const void *data, uint16_t size);
 
 void packet_ctrl_open(struct timeval *tv, struct ucred *cred, uint16_t index,

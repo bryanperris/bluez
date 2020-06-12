@@ -94,6 +94,17 @@ static void set_index(const char *arg)
 		mgmt_index = atoi(arg);
 }
 
+static bool parse_setting(int argc, char **argv, uint8_t *val)
+{
+	if (strcasecmp(argv[1], "on") == 0 || strcasecmp(argv[1], "yes") == 0)
+		*val = 1;
+	else if (strcasecmp(argv[1], "off") == 0)
+		*val = 0;
+	else
+		*val = atoi(argv[1]);
+	return true;
+}
+
 static void update_prompt(uint16_t index)
 {
 	char str[32];
@@ -353,6 +364,8 @@ static const char *settings_str[] = {
 				"privacy",
 				"configuration",
 				"static-addr",
+				"phy-configuration",
+				"wide-band-speech",
 };
 
 static const char *settings2str(uint32_t settings)
@@ -1023,7 +1036,7 @@ done:
 	bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
 
-static void cmd_version(int argc, char **argv)
+static void cmd_revision(int argc, char **argv)
 {
 	if (mgmt_send(mgmt, MGMT_OP_READ_VERSION, MGMT_INDEX_NONE,
 				0, NULL, version_rsp, NULL, NULL) == 0) {
@@ -1399,7 +1412,7 @@ static void ext_index_rsp(uint8_t status, uint16_t len, const void *param,
 							void *user_data)
 {
 	const struct mgmt_rp_read_ext_index_list *rp = param;
-	uint16_t count, index_filter = PTR_TO_UINT(user_data);
+	uint16_t count;
 	unsigned int i;
 
 	if (status != 0) {
@@ -1427,9 +1440,6 @@ static void ext_index_rsp(uint8_t status, uint16_t len, const void *param,
 	for (i = 0; i < count; i++) {
 		uint16_t index = le16_to_cpu(rp->entry[i].index);
 		char *busstr = hci_bustostr(rp->entry[i].bus);
-
-		if (index_filter != MGMT_INDEX_NONE && index_filter != index)
-			continue;
 
 		switch (rp->entry[i].type) {
 		case 0x00:
@@ -1469,13 +1479,260 @@ static void ext_index_rsp(uint8_t status, uint16_t len, const void *param,
 		bt_shell_noninteractive_quit(EXIT_SUCCESS);
 }
 
-static void cmd_extinfo(
-						int argc, char **argv)
+static void cmd_extinfo(int argc, char **argv)
 {
-	if (!mgmt_send(mgmt, MGMT_OP_READ_EXT_INDEX_LIST,
-				MGMT_INDEX_NONE, 0, NULL,
-				ext_index_rsp, UINT_TO_PTR(index), NULL)) {
-		error("Unable to send ext_index_list cmd");
+	if (mgmt_index == MGMT_INDEX_NONE) {
+		if (!mgmt_send(mgmt, MGMT_OP_READ_EXT_INDEX_LIST,
+					MGMT_INDEX_NONE, 0, NULL,
+					ext_index_rsp, mgmt, NULL)) {
+			error("Unable to send ext_index_list cmd");
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+
+		return;
+	}
+
+	if (!mgmt_send(mgmt, MGMT_OP_READ_EXT_INFO, mgmt_index, 0, NULL,
+					ext_info_rsp,
+					UINT_TO_PTR(mgmt_index), NULL)) {
+		error("Unable to send ext_read_info cmd");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+}
+
+static void sec_info_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	const struct mgmt_rp_read_security_info *rp = param;
+	uint16_t index = PTR_TO_UINT(user_data);
+
+	if (status != 0) {
+		error("Reading hci%u security failed with status 0x%02x (%s)",
+					index, status, mgmt_errstr(status));
+		goto done;
+	}
+
+	if (len < sizeof(*rp)) {
+		error("Too small info reply (%u bytes)", len);
+		goto done;
+	}
+
+	print("Primary controller (hci%u)", index);
+	print("\tSecurity info length: %u", le16_to_cpu(rp->sec_len));
+
+done:
+	pending_index--;
+
+	if (pending_index > 0)
+		return;
+
+	bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void sec_index_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	const struct mgmt_rp_read_ext_index_list *rp = param;
+	uint16_t count;
+	unsigned int i;
+
+	if (status != 0) {
+		error("Reading ext index list failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	if (len < sizeof(*rp)) {
+		error("Too small ext index list reply (%u bytes)", len);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	count = get_le16(&rp->num_controllers);
+
+	if (len < sizeof(*rp) + count * (sizeof(uint16_t) + sizeof(uint8_t))) {
+		error("Index count (%u) doesn't match reply length (%u)",
+								count, len);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	for (i = 0; i < count; i++) {
+		uint16_t index = le16_to_cpu(rp->entry[i].index);
+
+		if (rp->entry[i].type != 0x00)
+			continue;
+
+		if (!mgmt_send(mgmt, MGMT_OP_READ_SECURITY_INFO,
+						index, 0, NULL, sec_info_rsp,
+						UINT_TO_PTR(index), NULL)) {
+				error("Unable to send read_security_info cmd");
+				return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+		pending_index++;
+	}
+
+	if (!count)
+		bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void cmd_secinfo(int argc, char **argv)
+{
+	if (mgmt_index == MGMT_INDEX_NONE) {
+		if (!mgmt_send(mgmt, MGMT_OP_READ_EXT_INDEX_LIST,
+					MGMT_INDEX_NONE, 0, NULL,
+					sec_index_rsp, mgmt, NULL)) {
+			error("Unable to send ext_index_list cmd");
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+
+		return;
+	}
+
+	if (!mgmt_send(mgmt, MGMT_OP_READ_SECURITY_INFO, mgmt_index, 0, NULL,
+					sec_info_rsp,
+					UINT_TO_PTR(mgmt_index), NULL)) {
+		error("Unable to send read_security_info cmd");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+}
+
+static void exp_info_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	const struct mgmt_rp_read_exp_features_info *rp = param;
+	uint16_t index = PTR_TO_UINT(user_data);
+
+	if (status != 0) {
+		error("Reading hci%u exp features failed with status 0x%02x (%s)",
+					index, status, mgmt_errstr(status));
+		goto done;
+	}
+
+	if (len < sizeof(*rp)) {
+		error("Too small info reply (%u bytes)", len);
+		goto done;
+	}
+
+	if (index == MGMT_INDEX_NONE)
+		print("Global");
+	else
+		print("Primary controller (hci%u)", index);
+
+	print("\tNumber of experimental features: %u",
+					le16_to_cpu(rp->feature_count));
+
+done:
+	pending_index--;
+
+	if (pending_index > 0)
+		return;
+
+	bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void exp_index_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	const struct mgmt_rp_read_ext_index_list *rp = param;
+	uint16_t count;
+	unsigned int i;
+
+	if (status != 0) {
+		error("Reading ext index list failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	if (len < sizeof(*rp)) {
+		error("Too small ext index list reply (%u bytes)", len);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	count = get_le16(&rp->num_controllers);
+
+	if (len < sizeof(*rp) + count * (sizeof(uint16_t) + sizeof(uint8_t))) {
+		error("Index count (%u) doesn't match reply length (%u)",
+								count, len);
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+
+	for (i = 0; i < count; i++) {
+		uint16_t index = le16_to_cpu(rp->entry[i].index);
+
+		if (rp->entry[i].type != 0x00)
+			continue;
+
+		if (!mgmt_send(mgmt, MGMT_OP_READ_EXP_FEATURES_INFO,
+						index, 0, NULL, exp_info_rsp,
+						UINT_TO_PTR(index), NULL)) {
+				error("Unable to send read_exp_features_info cmd");
+				return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+		pending_index++;
+	}
+}
+
+static void cmd_expinfo(int argc, char **argv)
+{
+	if (mgmt_index == MGMT_INDEX_NONE) {
+		if (!mgmt_send(mgmt, MGMT_OP_READ_EXT_INDEX_LIST,
+					MGMT_INDEX_NONE, 0, NULL,
+					exp_index_rsp, mgmt, NULL)) {
+			error("Unable to send ext_index_list cmd");
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+
+		if (!mgmt_send(mgmt, MGMT_OP_READ_EXP_FEATURES_INFO,
+					MGMT_INDEX_NONE, 0, NULL,
+					exp_info_rsp,
+					UINT_TO_PTR(MGMT_INDEX_NONE), NULL)) {
+			error("Unable to send read_exp_features_info cmd");
+			return bt_shell_noninteractive_quit(EXIT_FAILURE);
+		}
+
+		pending_index++;
+		return;
+	}
+
+	if (!mgmt_send(mgmt, MGMT_OP_READ_EXP_FEATURES_INFO, mgmt_index,
+					0, NULL, exp_info_rsp,
+					UINT_TO_PTR(mgmt_index), NULL)) {
+		error("Unable to send read_exp_features_info cmd");
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+	}
+}
+
+static void exp_debug_rsp(uint8_t status, uint16_t len, const void *param,
+							void *user_data)
+{
+	if (status != 0)
+		error("Set debug feature failed with status 0x%02x (%s)",
+						status, mgmt_errstr(status));
+	else
+		print("Debug feature successfully set");
+
+	bt_shell_noninteractive_quit(EXIT_SUCCESS);
+}
+
+static void cmd_exp_debug(int argc, char **argv)
+{
+	/* d4992530-b9ec-469f-ab01-6c481c47da1c */
+	static const uint8_t uuid[16] = {
+				0x1c, 0xda, 0x47, 0x1c, 0x48, 0x6c, 0x01, 0xab,
+				0x9f, 0x46, 0xec, 0xb9, 0x30, 0x25, 0x99, 0xd4,
+	};
+	struct mgmt_cp_set_exp_feature cp;
+	uint8_t val;
+
+	if (parse_setting(argc, argv, &val) == false)
+		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(cp.uuid, uuid, 16);
+	cp.action = val;
+
+	if (mgmt_send(mgmt, MGMT_OP_SET_EXP_FEATURE, mgmt_index,
+			sizeof(cp), &cp, exp_debug_rsp, NULL, NULL) == 0) {
+		error("Unable to send debug feature cmd");
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
 	}
 }
@@ -1675,17 +1932,6 @@ static void setting_rsp(uint16_t op, uint16_t id, uint8_t status, uint16_t len,
 
 done:
 	bt_shell_noninteractive_quit(EXIT_SUCCESS);
-}
-
-static bool parse_setting(int argc, char **argv, uint8_t *val)
-{
-	if (strcasecmp(argv[1], "on") == 0 || strcasecmp(argv[1], "yes") == 0)
-		*val = 1;
-	else if (strcasecmp(argv[1], "off") == 0)
-		*val = 0;
-	else
-		*val = atoi(argv[1]);
-	return true;
 }
 
 static void cmd_setting(uint16_t op, int argc, char **argv)
@@ -4316,6 +4562,11 @@ static void cmd_phy(int argc, char **argv)
 	}
 }
 
+static void cmd_wbs(int argc, char **argv)
+{
+	cmd_setting(MGMT_OP_SET_WIDEBAND_SPEECH, argc, argv);
+}
+
 static void register_mgmt_callbacks(struct mgmt *mgmt, uint16_t index)
 {
 	mgmt_register(mgmt, MGMT_EV_CONTROLLER_ERROR, index, controller_error,
@@ -4389,8 +4640,8 @@ static const struct bt_shell_menu main_menu = {
 	.entries = {
 	{ "select",		"<index>",
 		cmd_select,		"Select a different index"	},
-	{ "version",		NULL,
-		cmd_version,		"Get the MGMT Version"		},
+	{ "revision",		NULL,
+		cmd_revision,		"Get the MGMT Revision"		},
 	{ "commands",		NULL,
 		cmd_commands,		"List supported commands"	},
 	{ "config",		NULL,
@@ -4453,7 +4704,7 @@ static const struct bt_shell_menu main_menu = {
 		cmd_keys,		"Load Link Keys"		},
 	{ "ltks",		NULL,
 		cmd_ltks,		"Load Long Term Keys"		},
-	{ "irks",		"[--local <index>] [--file <file path>]",
+	{ "irks",		"[--local index] [--file file path]",
 		cmd_irks,		"Load Identity Resolving Keys"	},
 	{ "block",		"[-t type] <remote address>",
 		cmd_block,		"Block Device"			},
@@ -4517,6 +4768,14 @@ static const struct bt_shell_menu main_menu = {
 				"[EDR2M1SLOT] [EDR2M3SLOT] [EDR2M5SLOT]"
 				"[EDR3M1SLOT] [EDR3M3SLOT] [EDR3M5SLOT]",
 		cmd_phy,		"Get/Set PHY Configuration"	},
+	{ "wbs",		"<on/off>",
+		cmd_wbs,		"Toggle Wideband-Speech support"},
+	{ "secinfo",		NULL,
+		cmd_secinfo,		"Show security information"	},
+	{ "expinfo",		NULL,
+		cmd_expinfo,		"Show experimental features"	},
+	{ "exp-debug",		"<on/off>",
+		cmd_exp_debug,		"Set debug feature"		},
 	{} },
 };
 

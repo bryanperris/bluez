@@ -57,6 +57,7 @@
 #define DEFAULT_START_ADDRESS	0x00aa
 #define DEFAULT_MAX_ADDRESS	(VIRTUAL_ADDRESS_LOW - 1)
 #define DEFAULT_NET_INDEX	0x0000
+#define MAX_CRPL_SIZE		0x7fff
 
 #define DEFAULT_CFG_FILE	"config_db.json"
 
@@ -112,7 +113,7 @@ static struct model_info *cfgcli;
 static struct l_queue *devices;
 
 static bool prov_in_progress;
-static const char *caps[2] = {"out-numeric", "in-numeric"};
+static const char *caps[] = {"static-oob", "out-numeric", "in-numeric"};
 
 static bool have_config;
 
@@ -122,7 +123,7 @@ static struct meshcfg_app app = {
 	.cid = 0x05f1,
 	.pid = 0x0002,
 	.vid = 0x0001,
-	.crpl = 10,
+	.crpl = MAX_CRPL_SIZE,
 	.ele = {
 		.path = "/mesh/cfgclient/ele0",
 		.index = 0,
@@ -231,6 +232,21 @@ struct key_data {
 	bool update;
 };
 
+static void append_dict_entry_basic(struct l_dbus_message_builder *builder,
+					const char *key, const char *signature,
+					const void *data)
+{
+	if (!builder)
+		return;
+
+	l_dbus_message_builder_enter_dict(builder, "sv");
+	l_dbus_message_builder_append_basic(builder, 's', key);
+	l_dbus_message_builder_enter_variant(builder, signature);
+	l_dbus_message_builder_append_basic(builder, signature[0], data);
+	l_dbus_message_builder_leave_variant(builder);
+	l_dbus_message_builder_leave_dict(builder);
+}
+
 static void append_byte_array(struct l_dbus_message_builder *builder,
 					unsigned char *data, unsigned int len)
 {
@@ -316,8 +332,22 @@ static bool send_key(void *user_data, uint16_t dst, uint16_t key_idx,
 	const char *method_name = (!is_appkey) ? "AddNetKey" : "AddAppKey";
 
 	net_idx = remote_get_subnet_idx(dst);
-	if (net_idx == NET_IDX_INVALID)
+	if (net_idx == NET_IDX_INVALID) {
+		bt_shell_printf("Node %4.4x not found\n", dst);
 		return false;
+	}
+
+	if (!is_appkey && !keys_subnet_exists(key_idx)) {
+		bt_shell_printf("Local NetKey %u (0x%3.3x) not found\n",
+							key_idx, key_idx);
+		return false;
+	}
+
+	if (is_appkey && (keys_get_bound_key(key_idx) == NET_IDX_INVALID)) {
+		bt_shell_printf("Local AppKey %u (0x%3.3x) not found\n",
+							key_idx, key_idx);
+		return false;
+	}
 
 	req = l_new(struct key_data, 1);
 	req->ele_path = user_data;
@@ -330,9 +360,38 @@ static bool send_key(void *user_data, uint16_t dst, uint16_t key_idx,
 				send_key_setup, NULL, req, l_free) != 0;
 }
 
+static void delete_node_setup(struct l_dbus_message *msg, void *user_data)
+{
+	struct generic_request *req = user_data;
+	uint16_t primary;
+	uint8_t ele_cnt;
+
+	primary = (uint16_t) req->arg1;
+	ele_cnt = (uint8_t) req->arg2;
+
+	l_dbus_message_set_arguments(msg, "qy", primary, ele_cnt);
+}
+
+static void delete_node(uint16_t primary, uint8_t ele_cnt)
+{
+	struct generic_request *req;
+
+	if (!local || !local->proxy || !local->mgmt_proxy) {
+		bt_shell_printf("Node is not attached\n");
+		return;
+	}
+
+	req = l_new(struct generic_request, 1);
+	req->arg1 = primary;
+	req->arg2 = ele_cnt;
+
+	l_dbus_proxy_method_call(local->mgmt_proxy, "DeleteRemoteNode",
+				delete_node_setup, NULL, req, l_free);
+}
+
 static void client_init(void)
 {
-	cfgcli = cfgcli_init(send_key, (void *) app.ele.path);
+	cfgcli = cfgcli_init(send_key, delete_node, (void *) app.ele.path);
 	cfgcli->ops.set_send_func(send_msg, (void *) app.ele.path);
 }
 
@@ -353,53 +412,147 @@ static bool caps_getter(struct l_dbus *dbus,
 	return true;
 }
 
+static void agent_input_done(oob_type_t type, void *buf, uint16_t len,
+								void *user_data)
+{
+	struct l_dbus_message *msg = user_data;
+	struct l_dbus_message *reply = NULL;
+	struct l_dbus_message_builder *builder;
+	uint32_t val_u32;
+	uint8_t oob_data[16];
+
+	switch (type) {
+	case NONE:
+	case OUTPUT:
+	default:
+		break;
+
+	case ASCII:
+		if (len > 8) {
+			bt_shell_printf("Bad input length\n");
+			break;
+		}
+		/* Fall Through */
+
+	case HEXADECIMAL:
+		if (len > 16) {
+			bt_shell_printf("Bad input length\n");
+			break;
+		}
+		memset(oob_data, 0, 16);
+		memcpy(oob_data, buf, len);
+		reply = l_dbus_message_new_method_return(msg);
+		builder = l_dbus_message_builder_new(reply);
+		append_byte_array(builder, oob_data, 16);
+		l_dbus_message_builder_finalize(builder);
+		l_dbus_message_builder_destroy(builder);
+		break;
+
+	case DECIMAL:
+		if (len > 8) {
+			bt_shell_printf("Bad input length\n");
+			break;
+		}
+
+		val_u32 = l_get_be32(buf);
+		reply = l_dbus_message_new_method_return(msg);
+		l_dbus_message_set_arguments(reply, "u", val_u32);
+		break;
+	}
+
+	if (!reply)
+		reply = l_dbus_message_new_error(msg, dbus_err_fail, NULL);
+
+	l_dbus_send(dbus, reply);
+}
+
+struct requested_action {
+	const char *action;
+	const char *description;
+};
+
+static struct requested_action display_numeric_table[] = {
+	{ "push", "Push remote button %d times"},
+	{ "twist", "Twist remote nob %d times"},
+	{ "in-numeric", "Enter %d on remote device"},
+	{ "out-numeric", "Enter %d on remote device"}
+};
+
+static struct requested_action prompt_numeric_table[] = {
+	{ "blink", "Enter the number of times remote LED blinked"},
+	{ "beep", "Enter the number of times remote device beeped"},
+	{ "vibrate", "Enter the number of times remote device vibrated"},
+	{ "in-numeric", "Enter the number displayed on remote device"},
+	{ "out-numeric", "Enter the number displayed on remote device"}
+};
+
+static int get_action(char *str, bool prompt)
+{
+	struct requested_action *action_table;
+	size_t len;
+	int i, sz;
+
+	if (!str)
+		return -1;
+
+	if (prompt) {
+		len = strlen(str);
+		sz = L_ARRAY_SIZE(prompt_numeric_table);
+		action_table = prompt_numeric_table;
+	} else {
+		len = strlen(str);
+		sz = L_ARRAY_SIZE(display_numeric_table);
+		action_table = display_numeric_table;
+	}
+
+	for (i = 0; i < sz; ++i)
+		if (len == strlen(action_table[i].action) &&
+			!strcmp(str, action_table[i].action))
+			return i;
+
+	return -1;
+}
+
 static struct l_dbus_message *disp_numeric_call(struct l_dbus *dbus,
 						struct l_dbus_message *msg,
 						void *user_data)
 {
 	char *str;
 	uint32_t n;
+	int action_index;
 
 	if (!l_dbus_message_get_arguments(msg, "su", &str, &n)) {
 		l_error("Cannot parse \"DisplayNumeric\" arguments");
 		return l_dbus_message_new_error(msg, dbus_err_fail, NULL);
 	}
 
-	if (!str || strlen(str) != strlen("in-numeric") ||
-			strncmp(str, "in-numeric", strlen("in-numeric")))
+	action_index = get_action(str, false);
+	if (action_index < 0)
 		return l_dbus_message_new_error(msg, dbus_err_support, NULL);
 
-	bt_shell_printf(COLOR_YELLOW "Enter %u on remote device" COLOR_OFF, n);
+	str = l_strdup_printf(display_numeric_table[action_index].description,
+									n);
+	bt_shell_printf(COLOR_YELLOW "%s\n" COLOR_OFF, str);
+	l_free(str);
 
 	return l_dbus_message_new_method_return(msg);
 }
 
-static void agent_input_done(oob_type_t type, void *buf, uint16_t len,
-								void *user_data)
+static struct l_dbus_message *disp_string_call(struct l_dbus *dbus,
+						struct l_dbus_message *msg,
+						void *user_data)
 {
-	struct l_dbus_message *msg = user_data;
-	struct l_dbus_message *reply;
-	uint32_t val_u32;
+	const char *prompt = "Enter AlphaNumeric code on remote device:";
+	char *str;
 
-	switch (type) {
-	case NONE:
-	case OUTPUT:
-	case ASCII:
-	case HEXADECIMAL:
-	default:
-		return;
-	case DECIMAL:
-		if (len >= 8) {
-			bt_shell_printf("Bad input length");
-			return;
-		}
-
-		val_u32 = l_get_be32(buf);
-		reply = l_dbus_message_new_method_return(msg);
-		l_dbus_message_set_arguments(reply, "u", val_u32);
-		l_dbus_send(dbus, reply);
-		break;
+	if (!l_dbus_message_get_arguments(msg, "s", &str)) {
+		l_error("Cannot parse \"DisplayString\" arguments");
+		return l_dbus_message_new_error(msg, dbus_err_fail, NULL);
 	}
+
+	bt_shell_printf(COLOR_YELLOW "%s %s\n" COLOR_OFF, prompt, str);
+
+	return l_dbus_message_new_method_return(msg);
 }
 
 static struct l_dbus_message *prompt_numeric_call(struct l_dbus *dbus,
@@ -407,18 +560,47 @@ static struct l_dbus_message *prompt_numeric_call(struct l_dbus *dbus,
 						void *user_data)
 {
 	char *str;
+	int action_index;
+	const char *desc;
 
 	if (!l_dbus_message_get_arguments(msg, "s", &str)) {
 		l_error("Cannot parse \"PromptNumeric\" arguments");
 		return l_dbus_message_new_error(msg, dbus_err_fail, NULL);
 	}
 
-	if (!str || strlen(str) != strlen("out-numeric") ||
-			strncmp(str, "out-numeric", strlen("out-numeric")))
+	action_index = get_action(str, true);
+	if (action_index < 0)
 		return l_dbus_message_new_error(msg, dbus_err_support, NULL);
 
+	desc = prompt_numeric_table[action_index].description;
+
 	l_dbus_message_ref(msg);
-	agent_input_request(DECIMAL, 8, agent_input_done, msg);
+	agent_input_request(DECIMAL, 8, desc, agent_input_done, msg);
+
+	return NULL;
+}
+
+static struct l_dbus_message *prompt_static_call(struct l_dbus *dbus,
+						struct l_dbus_message *msg,
+						void *user_data)
+{
+	char *str;
+
+	if (!l_dbus_message_get_arguments(msg, "s", &str) || !str) {
+		l_error("Cannot parse \"PromptStatic\" arguments");
+		return l_dbus_message_new_error(msg, dbus_err_fail, NULL);
+	}
+
+	if (!strcmp(str, "in-alpha") || !strcmp(str, "out-alpha")) {
+		l_dbus_message_ref(msg);
+		agent_input_request(ASCII, 8, "Enter displayed Ascii code",
+							agent_input_done, msg);
+	} else if (!strcmp(str, "static-oob")) {
+		l_dbus_message_ref(msg);
+		agent_input_request(HEXADECIMAL, 16, "Enter Static Key",
+							agent_input_done, msg);
+	} else
+		return l_dbus_message_new_error(msg, dbus_err_support, NULL);
 
 	return NULL;
 }
@@ -428,11 +610,14 @@ static void setup_agent_iface(struct l_dbus_interface *iface)
 	l_dbus_interface_property(iface, "Capabilities", 0, "as", caps_getter,
 								NULL);
 	/* TODO: Other properties */
+	l_dbus_interface_method(iface, "DisplayString", 0, disp_string_call,
+							"", "s", "value");
 	l_dbus_interface_method(iface, "DisplayNumeric", 0, disp_numeric_call,
 						"", "su", "type", "number");
 	l_dbus_interface_method(iface, "PromptNumeric", 0, prompt_numeric_call,
 						"u", "s", "number", "type");
-
+	l_dbus_interface_method(iface, "PromptStatic", 0, prompt_static_call,
+						"ay", "s", "data", "type");
 }
 
 static bool register_agent(void)
@@ -446,6 +631,13 @@ static bool register_agent(void)
 	if (!l_dbus_register_object(dbus, app.agent_path, NULL, NULL,
 				MESH_PROVISION_AGENT_INTERFACE, NULL, NULL)) {
 		l_error("Failed to register object %s", app.agent_path);
+		return false;
+	}
+
+	if (!l_dbus_object_add_interface(dbus, app.agent_path,
+					 L_DBUS_INTERFACE_PROPERTIES, NULL)) {
+		l_error("Failed to add interface %s",
+					L_DBUS_INTERFACE_PROPERTIES);
 		return false;
 	}
 
@@ -517,44 +709,13 @@ static void attach_node_setup(struct l_dbus_message *msg, void *user_data)
 static void create_net_reply(struct l_dbus_proxy *proxy,
 				struct l_dbus_message *msg, void *user_data)
 {
-	char *str;
-	uint64_t tmp;
-
 	if (l_dbus_message_is_error(msg)) {
 		const char *name;
 
 		l_dbus_message_get_error(msg, &name, NULL);
 		l_error("Failed to create network: %s", name);
 		return;
-
 	}
-
-	if (!l_dbus_message_get_arguments(msg, "t", &tmp))
-		return;
-
-	local = l_new(struct meshcfg_node, 1);
-	local->token.u64 = l_get_be64(&tmp);
-	str = l_util_hexstring(&local->token.u8[0], 8);
-	bt_shell_printf("Created new node with token %s\n", str);
-	l_free(str);
-
-	if (!mesh_db_create(cfg_fname, local->token.u8,
-						"Mesh Config Client Network")) {
-		l_free(local);
-		local = NULL;
-		return;
-	}
-
-	mesh_db_set_addr_range(low_addr, high_addr);
-	keys_add_net_key(PRIMARY_NET_IDX);
-	mesh_db_net_key_add(PRIMARY_NET_IDX);
-
-	remote_add_node(app.uuid, 0x0001, 1, PRIMARY_NET_IDX);
-	mesh_db_add_node(app.uuid, 0x0001, 1, PRIMARY_NET_IDX);
-
-	l_dbus_proxy_method_call(net_proxy, "Attach", attach_node_setup,
-						attach_node_reply, NULL,
-						NULL);
 }
 
 static void create_net_setup(struct l_dbus_message *msg, void *user_data)
@@ -601,9 +762,15 @@ static void scan_reply(struct l_dbus_proxy *proxy, struct l_dbus_message *msg,
 
 static void scan_setup(struct l_dbus_message *msg, void *user_data)
 {
-	int32_t secs = L_PTR_TO_UINT(user_data);
+	uint16_t secs = (uint16_t) L_PTR_TO_UINT(user_data);
+	struct l_dbus_message_builder *builder;
 
-	l_dbus_message_set_arguments(msg, "q", (uint16_t) secs);
+	builder = l_dbus_message_builder_new(msg);
+	l_dbus_message_builder_enter_array(builder, "{sv}");
+	append_dict_entry_basic(builder, "Seconds", "q", &secs);
+	l_dbus_message_builder_leave_array(builder);
+	l_dbus_message_builder_finalize(builder);
+	l_dbus_message_builder_destroy(builder);
 }
 
 static void cmd_scan_unprov(int argc, char *argv[])
@@ -660,50 +827,6 @@ static void free_generic_request(void *data)
 
 	l_free(req->data1);
 	l_free(req->data2);
-	l_free(req);
-}
-
-static void delete_node_setup(struct l_dbus_message *msg, void *user_data)
-{
-	struct generic_request *req = user_data;
-	uint16_t primary;
-	uint8_t ele_cnt;
-
-	primary = (uint16_t) req->arg1;
-	ele_cnt = (uint8_t) req->arg2;
-
-	l_dbus_message_set_arguments(msg, "qy", primary, ele_cnt);
-}
-
-static void cmd_delete_node(int argc, char *argv[])
-{
-	struct generic_request *req;
-
-	if (!local || !local->proxy || !local->mgmt_proxy) {
-		bt_shell_printf("Node is not attached\n");
-		return;
-	}
-
-	if (argc < 3) {
-		bt_shell_printf("Unicast and element count are required\n");
-		return;
-	}
-
-	req = l_new(struct generic_request, 1);
-
-	if (sscanf(argv[1], "%04x", &req->arg1) != 1)
-		goto fail;
-
-	if (sscanf(argv[2], "%u", &req->arg2) != 1)
-		goto fail;
-
-	l_dbus_proxy_method_call(local->mgmt_proxy, "DeleteRemoteNode",
-				delete_node_setup, NULL, req, l_free);
-
-	/* TODO:: Delete node from configuration */
-	return;
-
-fail:
 	l_free(req);
 }
 
@@ -805,14 +928,25 @@ fail:
 static void subnet_set_phase_reply(struct l_dbus_proxy *proxy,
 				struct l_dbus_message *msg, void *user_data)
 {
+	struct generic_request *req = user_data;
+	uint16_t net_idx;
+	uint8_t phase;
+
 	if (l_dbus_message_is_error(msg)) {
 		const char *name;
 
 		l_dbus_message_get_error(msg, &name, NULL);
 		l_error("Failed to set subnet phase: %s", name);
+		return;
 	}
 
-	/* TODO: Set key phase in configuration */
+	net_idx = (uint16_t) req->arg1;
+	phase = (uint8_t) req->arg2;
+
+	if (phase == KEY_REFRESH_PHASE_THREE)
+		phase = KEY_REFRESH_PHASE_NONE;
+
+	keys_set_net_key_phase(net_idx, phase, true);
 }
 
 static void subnet_set_phase_setup(struct l_dbus_message *msg, void *user_data)
@@ -871,6 +1005,7 @@ static void mgr_key_reply(struct l_dbus_proxy *proxy,
 
 		l_dbus_message_get_error(msg, &name, NULL);
 		l_error("Method %s returned error: %s", method, name);
+		bt_shell_printf("Method %s returned error: %s\n", method, name);
 		return;
 	}
 
@@ -880,6 +1015,8 @@ static void mgr_key_reply(struct l_dbus_proxy *proxy,
 	} else if (!strcmp("DeleteSubnet", method)) {
 		keys_del_net_key(idx);
 		mesh_db_net_key_del(idx);
+	} else if (!strcmp("UpdateSubnet", method)) {
+		keys_set_net_key_phase(idx, KEY_REFRESH_PHASE_ONE, true);
 	} else if (!strcmp("DeleteAppKey", method)) {
 		keys_del_app_key(idx);
 		mesh_db_app_key_del(idx);
@@ -1160,6 +1297,9 @@ static void add_node_setup(struct l_dbus_message *msg, void *user_data)
 
 	builder = l_dbus_message_builder_new(msg);
 	append_byte_array(builder, uuid, 16);
+	l_dbus_message_builder_enter_array(builder, "{sv}");
+	/* TODO: populate with options when defined */
+	l_dbus_message_builder_leave_array(builder);
 	l_dbus_message_builder_finalize(builder);
 	l_dbus_message_builder_destroy(builder);
 
@@ -1221,8 +1361,6 @@ static const struct bt_shell_menu main_menu = {
 	{ "node-import", "<uuid> <net_idx> <primary> <ele_count> <dev_key>",
 			cmd_import_node,
 			"Import an externally provisioned remote node"},
-	{ "node-delete", "<primary> <ele_count>", cmd_delete_node,
-			"Delete a remote node"},
 	{ "list-nodes", NULL, cmd_list_nodes,
 			"List remote mesh nodes"},
 	{ "keys", NULL, cmd_keys,
@@ -1386,17 +1524,17 @@ static struct l_dbus_message *scan_result_call(struct l_dbus *dbus,
 						struct l_dbus_message *msg,
 						void *user_data)
 {
-	struct l_dbus_message_iter iter;
+	struct l_dbus_message_iter iter, opts;
 	int16_t rssi;
 	uint32_t n;
 	uint8_t *prov_data;
 	char *str;
 	struct unprov_device *dev;
+	const char *sig = "naya{sv}";
 
-	if (!l_dbus_message_get_arguments(msg, "nay", &rssi, &iter)) {
+	if (!l_dbus_message_get_arguments(msg, sig, &rssi, &iter, &opts)) {
 		l_error("Cannot parse scan results");
 		return l_dbus_message_new_error(msg, dbus_err_args, NULL);
-
 	}
 
 	if (!l_dbus_message_iter_get_fixed_array(&iter, &prov_data, &n) ||
@@ -1410,6 +1548,19 @@ static struct l_dbus_message *scan_result_call(struct l_dbus *dbus,
 	str = l_util_hexstring_upper(prov_data, 16);
 	bt_shell_printf("\t" COLOR_GREEN "UUID = %s\n" COLOR_OFF, str);
 	l_free(str);
+
+	if (n >= 18) {
+		str = l_util_hexstring_upper(prov_data + 16, 2);
+		bt_shell_printf("\t" COLOR_GREEN "OOB = %s\n" COLOR_OFF, str);
+		l_free(str);
+	}
+
+	if (n >= 22) {
+		str = l_util_hexstring_upper(prov_data + 18, 4);
+		bt_shell_printf("\t" COLOR_GREEN "URI Hash = %s\n" COLOR_OFF,
+									str);
+		l_free(str);
+	}
 
 	/* TODO: Handle the rest of provisioning data if present */
 
@@ -1547,7 +1698,7 @@ static struct l_dbus_message *add_node_fail_call(struct l_dbus *dbus,
 static void setup_prov_iface(struct l_dbus_interface *iface)
 {
 	l_dbus_interface_method(iface, "ScanResult", 0, scan_result_call, "",
-							"nay", "rssi", "data");
+					"naya{sv}", "rssi", "data", "options");
 
 	l_dbus_interface_method(iface, "RequestProvData", 0, req_prov_call,
 				"qq", "y", "net_index", "unicast", "count");
@@ -1599,6 +1750,48 @@ static bool crpl_getter(struct l_dbus *dbus,
 	return true;
 }
 
+static void attach_node(void *user_data)
+{
+	l_dbus_proxy_method_call(net_proxy, "Attach", attach_node_setup,
+						attach_node_reply, NULL,
+						NULL);
+}
+
+static struct l_dbus_message *join_complete(struct l_dbus *dbus,
+						struct l_dbus_message *message,
+						void *user_data)
+{
+	char *str;
+	uint64_t tmp;
+
+	if (!l_dbus_message_get_arguments(message, "t", &tmp))
+		return l_dbus_message_new_error(message, dbus_err_args, NULL);
+
+	local = l_new(struct meshcfg_node, 1);
+	local->token.u64 = l_get_be64(&tmp);
+	str = l_util_hexstring(&local->token.u8[0], 8);
+	bt_shell_printf("Created new node with token %s\n", str);
+	l_free(str);
+
+	if (!mesh_db_create(cfg_fname, local->token.u8,
+					"Mesh Config Client Network")) {
+		l_free(local);
+		local = NULL;
+		return l_dbus_message_new_error(message, dbus_err_fail, NULL);
+	}
+
+	mesh_db_set_addr_range(low_addr, high_addr);
+	keys_add_net_key(PRIMARY_NET_IDX);
+	mesh_db_net_key_add(PRIMARY_NET_IDX);
+
+	remote_add_node(app.uuid, 0x0001, 1, PRIMARY_NET_IDX);
+	mesh_db_add_node(app.uuid, 0x0001, 1, PRIMARY_NET_IDX);
+
+	l_idle_oneshot(attach_node, NULL, NULL);
+
+	return l_dbus_message_new_method_return(message);
+}
+
 static void setup_app_iface(struct l_dbus_interface *iface)
 {
 	l_dbus_interface_property(iface, "CompanyID", 0, "q", cid_getter,
@@ -1608,6 +1801,9 @@ static void setup_app_iface(struct l_dbus_interface *iface)
 	l_dbus_interface_property(iface, "ProductID", 0, "q", pid_getter,
 									NULL);
 	l_dbus_interface_property(iface, "CRPL", 0, "q", crpl_getter, NULL);
+
+	l_dbus_interface_method(iface, "JoinComplete", 0, join_complete,
+							"", "t", "token");
 
 	/* TODO: Methods */
 }

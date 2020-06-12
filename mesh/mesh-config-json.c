@@ -54,6 +54,7 @@ struct mesh_config {
 	uint8_t uuid[16];
 	uint32_t write_seq;
 	struct timeval write_time;
+	struct l_queue *idles;
 };
 
 struct write_info {
@@ -104,7 +105,7 @@ static bool get_int(json_object *jobj, const char *keyword, int *value)
 	return true;
 }
 
-static bool add_u64_value(json_object *jobject, const char *desc,
+static bool add_u64_value(json_object *jobj, const char *desc,
 					const uint8_t u64[8])
 {
 	json_object *jstring;
@@ -115,11 +116,12 @@ static bool add_u64_value(json_object *jobject, const char *desc,
 	if (!jstring)
 		return false;
 
-	json_object_object_add(jobject, desc, jstring);
+	json_object_object_del(jobj, desc);
+	json_object_object_add(jobj, desc, jstring);
 	return true;
 }
 
-static bool add_key_value(json_object *jobject, const char *desc,
+static bool add_key_value(json_object *jobj, const char *desc,
 					const uint8_t key[16])
 {
 	json_object *jstring;
@@ -130,7 +132,8 @@ static bool add_key_value(json_object *jobject, const char *desc,
 	if (!jstring)
 		return false;
 
-	json_object_object_add(jobject, desc, jstring);
+	json_object_object_del(jobj, desc);
+	json_object_object_add(jobj, desc, jstring);
 	return true;
 }
 
@@ -232,15 +235,9 @@ static bool jarray_has_string(json_object *jarray, char *str, size_t len)
 	return false;
 }
 
-static json_object *jarray_string_del(json_object *jarray, char *str,
-								size_t len)
+static void jarray_string_del(json_object *jarray, char *str, size_t len)
 {
 	int i, sz = json_object_array_length(jarray);
-	json_object *jarray_new;
-
-	jarray_new = json_object_new_array();
-	if (!jarray_new)
-		return NULL;
 
 	for (i = 0; i < sz; ++i) {
 		json_object *jentry;
@@ -248,14 +245,13 @@ static json_object *jarray_string_del(json_object *jarray, char *str,
 
 		jentry = json_object_array_get_idx(jarray, i);
 		str_entry = (char *)json_object_get_string(jentry);
-		if (str_entry && !strncmp(str, str_entry, len))
-			continue;
 
-		json_object_get(jentry);
-		json_object_array_add(jarray_new, jentry);
+		if (str_entry && !strncmp(str, str_entry, len)) {
+			json_object_array_del_idx(jarray, i, 1);
+			return;
+		}
+
 	}
-
-	return jarray_new;
 }
 
 static json_object *get_key_object(json_object *jarray, uint16_t idx)
@@ -304,14 +300,9 @@ static bool get_key_index(json_object *jobj, const char *keyword,
 	return true;
 }
 
-static json_object *jarray_key_del(json_object *jarray, int16_t idx)
+static void jarray_key_del(json_object *jarray, int16_t idx)
 {
-	json_object *jarray_new;
 	int i, sz = json_object_array_length(jarray);
-
-	jarray_new = json_object_new_array();
-	if (!jarray_new)
-		return NULL;
 
 	for (i = 0; i < sz; ++i) {
 		json_object *jentry;
@@ -319,14 +310,11 @@ static json_object *jarray_key_del(json_object *jarray, int16_t idx)
 
 		jentry = json_object_array_get_idx(jarray, i);
 
-		if (get_key_index(jentry, "index", &nidx) && nidx == idx)
-			continue;
-
-		json_object_get(jentry);
-		json_object_array_add(jarray_new, jentry);
+		if (get_key_index(jentry, "index", &nidx) && nidx == idx) {
+			json_object_array_del_idx(jarray, i, 1);
+			return;
+		}
 	}
-
-	return jarray_new;
 }
 
 static bool read_unicast_address(json_object *jobj, uint16_t *unicast)
@@ -358,7 +346,7 @@ static bool read_default_ttl(json_object *jobj, uint8_t *ttl)
 	if (!val && errno == EINVAL)
 		return false;
 
-	if (val < 0 || val == 1 || val > DEFAULT_TTL)
+	if (val < 0 || val == 1 || val > TTL_MASK)
 		return false;
 
 	*ttl = (uint8_t) val;
@@ -380,7 +368,7 @@ static bool read_seq_number(json_object *jobj, uint32_t *seq_number)
 	if (!val && errno == EINVAL)
 		return false;
 
-	if (val < 0 || val > 0xffffff)
+	if (val < 0 || val > SEQ_MASK + 1)
 		return false;
 
 	*seq_number = (uint32_t) val;
@@ -459,8 +447,6 @@ static bool read_app_keys(json_object *jobj, struct mesh_config_node *node)
 	if (!len)
 		return true;
 
-	node->appkeys = l_queue_new();
-
 	for (i = 0; i < len; ++i) {
 		json_object *jtemp, *jvalue;
 		char *str;
@@ -516,8 +502,6 @@ static bool read_net_keys(json_object *jobj, struct mesh_config_node *node)
 	len = json_object_array_length(jarray);
 	if (!len)
 		return false;
-
-	node->netkeys = l_queue_new();
 
 	for (i = 0; i < len; ++i) {
 		json_object *jtemp, *jvalue;
@@ -660,39 +644,20 @@ bool mesh_config_net_key_update(struct mesh_config *cfg, uint16_t idx,
 
 bool mesh_config_net_key_del(struct mesh_config *cfg, uint16_t idx)
 {
-	json_object *jnode, *jarray, *jarray_new;
+	json_object *jnode, *jarray;
 
 	if (!cfg)
 		return false;
 
 	jnode = cfg->jnode;
 
-	/* TODO: Decide if we treat this as an error: no network keys??? */
 	if (!json_object_object_get_ex(jnode, "netKeys", &jarray))
 		return true;
 
-	/* Check if matching entry exists */
-	if (!get_key_object(jarray, idx))
-		return true;
+	jarray_key_del(jarray, idx);
 
-	if (json_object_array_length(jarray) == 1) {
+	if (!json_object_array_length(jarray))
 		json_object_object_del(jnode, "netKeys");
-		/* TODO: Do we raise an error here? */
-		l_warn("Removing the last network key! Zero keys left.");
-		return save_config(jnode, cfg->node_dir_path);
-	}
-
-	/*
-	 * There is no easy way to delete a value from json array.
-	 * Create a new copy without specified element and
-	 * then remove old array.
-	 */
-	jarray_new = jarray_key_del(jarray, idx);
-	if (!jarray_new)
-		return false;
-
-	json_object_object_del(jnode, "netKeys");
-	json_object_object_add(jnode, "netKeys", jarray_new);
 
 	return save_config(jnode, cfg->node_dir_path);
 }
@@ -810,7 +775,7 @@ bool mesh_config_app_key_update(struct mesh_config *cfg, uint16_t app_idx,
 bool mesh_config_app_key_del(struct mesh_config *cfg, uint16_t net_idx,
 								uint16_t idx)
 {
-	json_object *jnode, *jarray, *jarray_new;
+	json_object *jnode, *jarray;
 
 	if (!cfg)
 		return false;
@@ -820,26 +785,10 @@ bool mesh_config_app_key_del(struct mesh_config *cfg, uint16_t net_idx,
 	if (!json_object_object_get_ex(jnode, "appKeys", &jarray))
 		return true;
 
-	/* Check if matching entry exists */
-	if (!get_key_object(jarray, idx))
-		return true;
+	jarray_key_del(jarray, idx);
 
-	if (json_object_array_length(jarray) == 1) {
+	if (!json_object_array_length(jarray))
 		json_object_object_del(jnode, "appKeys");
-		return true;
-	}
-
-	/*
-	 * There is no easy way to delete a value from json array.
-	 * Create a new copy without specified element and
-	 * then remove old array.
-	 */
-	jarray_new = jarray_key_del(jarray, idx);
-	if (!jarray_new)
-		return false;
-
-	json_object_object_del(jnode, "appKeys");
-	json_object_object_add(jnode, "appKeys", jarray_new);
 
 	return save_config(jnode, cfg->node_dir_path);
 }
@@ -893,7 +842,7 @@ bool mesh_config_model_binding_del(struct mesh_config *cfg, uint16_t ele_addr,
 						bool vendor, uint32_t mod_id,
 							uint16_t app_idx)
 {
-	json_object *jnode, *jmodel, *jarray, *jarray_new;
+	json_object *jnode, *jmodel, *jarray;
 	int ele_idx;
 	char buf[5];
 
@@ -915,25 +864,10 @@ bool mesh_config_model_binding_del(struct mesh_config *cfg, uint16_t ele_addr,
 
 	snprintf(buf, 5, "%4.4x", app_idx);
 
-	if (!jarray_has_string(jarray, buf, 4))
-		return true;
+	jarray_string_del(jarray, buf, 4);
 
-	if (json_object_array_length(jarray) == 1) {
+	if (!json_object_array_length(jarray))
 		json_object_object_del(jmodel, "bind");
-		return true;
-	}
-
-	/*
-	 * There is no easy way to delete a value from json array.
-	 * Create a new copy without specified element and
-	 * then remove old array.
-	 */
-	jarray_new = jarray_string_del(jarray, buf, 4);
-	if (!jarray_new)
-		return false;
-
-	json_object_object_del(jmodel, "bind");
-	json_object_object_add(jmodel, "bind", jarray_new);
 
 	return save_config(jnode, cfg->node_dir_path);
 }
@@ -1195,8 +1129,6 @@ static bool parse_elements(json_object *jelems, struct mesh_config_node *node)
 		/* Allow "empty" nodes */
 		return true;
 
-	node->elements = l_queue_new();
-
 	for (i = 0; i < num_ele; ++i) {
 		json_object *jelement;
 		json_object *jmodels;
@@ -1216,6 +1148,7 @@ static bool parse_elements(json_object *jelems, struct mesh_config_node *node)
 		ele = l_new(struct mesh_config_element, 1);
 		ele->index = index;
 		ele->models = l_queue_new();
+		l_queue_push_tail(node->elements, ele);
 
 		if (!json_object_object_get_ex(jelement, "location", &jvalue))
 			goto fail;
@@ -1229,8 +1162,6 @@ static bool parse_elements(json_object *jelems, struct mesh_config_node *node)
 						!parse_models(jmodels, ele))
 				goto fail;
 		}
-
-		l_queue_push_tail(node->elements, ele);
 	}
 
 	return true;
@@ -1462,6 +1393,7 @@ static bool write_uint16_hex(json_object *jobj, const char *desc,
 	if (!jstring)
 		return false;
 
+	json_object_object_del(jobj, desc);
 	json_object_object_add(jobj, desc, jstring);
 	return true;
 }
@@ -1476,21 +1408,21 @@ static bool write_uint32_hex(json_object *jobj, const char *desc, uint32_t val)
 	if (!jstring)
 		return false;
 
+	json_object_object_del(jobj, desc);
 	json_object_object_add(jobj, desc, jstring);
 	return true;
 }
 
-static bool write_int(json_object *jobj, const char *keyword, int val)
+static bool write_int(json_object *jobj, const char *desc, int val)
 {
 	json_object *jvalue;
-
-	json_object_object_del(jobj, keyword);
 
 	jvalue = json_object_new_int(val);
 	if (!jvalue)
 		return false;
 
-	json_object_object_add(jobj, keyword, jvalue);
+	json_object_object_del(jobj, desc);
+	json_object_object_add(jobj, desc, jvalue);
 	return true;
 }
 
@@ -1506,7 +1438,7 @@ static const char *mode_to_string(int mode)
 	}
 }
 
-static bool write_mode(json_object *jobj, const char *keyword, int value)
+static bool write_mode(json_object *jobj, const char *desc, int value)
 {
 	json_object *jstring;
 
@@ -1515,7 +1447,8 @@ static bool write_mode(json_object *jobj, const char *keyword, int value)
 	if (!jstring)
 		return false;
 
-	json_object_object_add(jobj, keyword, jstring);
+	json_object_object_del(jobj, desc);
+	json_object_object_add(jobj, desc, jstring);
 
 	return true;
 }
@@ -1742,6 +1675,7 @@ static struct mesh_config *create_config(const char *cfg_path,
 	memcpy(cfg->uuid, uuid, 16);
 	cfg->node_dir_path = l_strdup(cfg_path);
 	cfg->write_seq = node->seq_number;
+	cfg->idles = l_queue_new();
 	gettimeofday(&cfg->write_time, NULL);
 
 	return cfg;
@@ -1994,7 +1928,7 @@ bool mesh_config_model_sub_del(struct mesh_config *cfg, uint16_t ele_addr,
 						uint32_t mod_id, bool vendor,
 						struct mesh_config_sub *sub)
 {
-	json_object *jnode, *jmodel, *jarray, *jarray_new;
+	json_object *jnode, *jmodel, *jarray;
 	char buf[33];
 	int len, ele_idx;
 
@@ -2022,25 +1956,10 @@ bool mesh_config_model_sub_del(struct mesh_config *cfg, uint16_t ele_addr,
 		len = 32;
 	}
 
-	if (!jarray_has_string(jarray, buf, len))
-		return true;
+	jarray_string_del(jarray, buf, len);
 
-	if (json_object_array_length(jarray) == 1) {
+	if (!json_object_array_length(jarray))
 		json_object_object_del(jmodel, "subscribe");
-		return true;
-	}
-
-	/*
-	 * There is no easy way to delete a value from a json array.
-	 * Create a new copy without specified element and
-	 * then remove old array.
-	 */
-	jarray_new = jarray_string_del(jarray, buf, len);
-	if (!jarray_new)
-		return false;
-
-	json_object_object_del(jmodel, "subscribe");
-	json_object_object_add(jmodel, "subscribe", jarray_new);
 
 	return save_config(jnode, cfg->node_dir_path);
 }
@@ -2058,7 +1977,7 @@ bool mesh_config_model_sub_del_all(struct mesh_config *cfg, uint16_t addr,
 bool mesh_config_write_seq_number(struct mesh_config *cfg, uint32_t seq,
 								bool cache)
 {
-	int value;
+	int value = 0;
 	uint32_t cached = 0;
 
 	if (!cfg)
@@ -2093,15 +2012,34 @@ bool mesh_config_write_seq_number(struct mesh_config *cfg, uint32_t seq,
 		timersub(&now, &cfg->write_time, &elapsed);
 		elapsed_ms = elapsed.tv_sec * 1000 + elapsed.tv_usec / 1000;
 
+		/*
+		 * If time since last write is zero, this means that
+		 * idle_save_config is already pending, so we don't need to do
+		 * anything.
+		 */
+		if (!elapsed_ms)
+			return true;
+
 		cached = seq + (seq - cfg->write_seq) *
 					1000 * MIN_SEQ_CACHE_TIME / elapsed_ms;
 
 		if (cached < seq + MIN_SEQ_CACHE_VALUE)
 			cached = seq + MIN_SEQ_CACHE_VALUE;
 
-		l_debug("Seq Cache: %d -> %d", seq, cached);
+		/* Cap the seq cache maximum to fixed out-of-range value.
+		 * If daemon restarts with out-of-range value, no packets
+		 * are to be sent until IV Update procedure completes.
+		 */
+		if (cached > SEQ_MASK)
+			cached = SEQ_MASK + 1;
 
 		cfg->write_seq = seq;
+
+		/* Don't rewrite NVM storage if unchanged */
+		if (value == (int) cached)
+			return true;
+
+		l_debug("Seq Cache: %d -> %d", seq, cached);
 
 		if (!write_int(cfg->jnode, "sequenceNumber", cached))
 		    return false;
@@ -2115,6 +2053,38 @@ bool mesh_config_write_seq_number(struct mesh_config *cfg, uint32_t seq,
 bool mesh_config_write_ttl(struct mesh_config *cfg, uint8_t ttl)
 {
 	if (!cfg || !write_int(cfg->jnode, "defaultTTL", ttl))
+		return false;
+
+	return save_config(cfg->jnode, cfg->node_dir_path);
+}
+
+bool mesh_config_update_company_id(struct mesh_config *cfg, uint16_t cid)
+{
+	if (!cfg || !write_uint16_hex(cfg->jnode, "cid", cid))
+		return false;
+
+	return save_config(cfg->jnode, cfg->node_dir_path);
+}
+
+bool mesh_config_update_product_id(struct mesh_config *cfg, uint16_t pid)
+{
+	if (!cfg || !write_uint16_hex(cfg->jnode, "pid", pid))
+		return false;
+
+	return save_config(cfg->jnode, cfg->node_dir_path);
+}
+
+bool mesh_config_update_version_id(struct mesh_config *cfg, uint16_t vid)
+{
+	if (!cfg || !write_uint16_hex(cfg->jnode, "vid", vid))
+		return false;
+
+	return save_config(cfg->jnode, cfg->node_dir_path);
+}
+
+bool mesh_config_update_crpl(struct mesh_config *cfg, uint16_t crpl)
+{
+	if (!cfg || !write_uint16_hex(cfg->jnode, "crpl", crpl))
 		return false;
 
 	return save_config(cfg->jnode, cfg->node_dir_path);
@@ -2164,6 +2134,11 @@ static bool load_node(const char *fname, const uint8_t uuid[16],
 		goto done;
 
 	memset(&node, 0, sizeof(node));
+
+	node.elements = l_queue_new();
+	node.netkeys = l_queue_new();
+	node.appkeys = l_queue_new();
+
 	result = read_node(jnode, &node);
 
 	if (result) {
@@ -2173,11 +2148,13 @@ static bool load_node(const char *fname, const uint8_t uuid[16],
 		memcpy(cfg->uuid, uuid, 16);
 		cfg->node_dir_path = l_strdup(fname);
 		cfg->write_seq = node.seq_number;
+		cfg->idles = l_queue_new();
 		gettimeofday(&cfg->write_time, NULL);
 
 		result = cb(&node, uuid, cfg, user_data);
 
 		if (!result) {
+			l_free(cfg->idles);
 			l_free(cfg->node_dir_path);
 			l_free(cfg);
 		}
@@ -2187,6 +2164,7 @@ static bool load_node(const char *fname, const uint8_t uuid[16],
 	l_free(node.net_transmit);
 	l_queue_destroy(node.netkeys, l_free);
 	l_queue_destroy(node.appkeys, l_free);
+	l_queue_destroy(node.elements, free_element);
 
 	if (!result)
 		json_object_put(jnode);
@@ -2199,17 +2177,26 @@ done:
 	return result;
 }
 
+static void release_idle(void *data)
+{
+	struct l_idle *idle = data;
+
+	l_idle_remove(idle);
+}
+
 void mesh_config_release(struct mesh_config *cfg)
 {
 	if (!cfg)
 		return;
+
+	l_queue_destroy(cfg->idles, release_idle);
 
 	l_free(cfg->node_dir_path);
 	json_object_put(cfg->jnode);
 	l_free(cfg);
 }
 
-static void idle_save_config(void *user_data)
+static void idle_save_config(struct l_idle *idle, void *user_data)
 {
 	struct write_info *info = user_data;
 	char *fname_tmp, *fname_bak, *fname_cfg;
@@ -2238,6 +2225,11 @@ static void idle_save_config(void *user_data)
 	if (info->cb)
 		info->cb(info->user_data, result);
 
+	if (idle) {
+		l_queue_remove(info->cfg->idles, idle);
+		l_idle_remove(idle);
+	}
+
 	l_free(info);
 
 }
@@ -2255,10 +2247,14 @@ bool mesh_config_save(struct mesh_config *cfg, bool no_wait,
 	info->cb = cb;
 	info->user_data = user_data;
 
-	if (no_wait)
-		idle_save_config(info);
-	else
-		l_idle_oneshot(idle_save_config, info, NULL);
+	if (no_wait) {
+		idle_save_config(NULL, info);
+	} else {
+		struct l_idle *idle;
+
+		idle = l_idle_create(idle_save_config, info, NULL);
+		l_queue_push_tail(cfg->idles, idle);
+	}
 
 	return true;
 }
@@ -2321,25 +2317,7 @@ bool mesh_config_load_nodes(const char *cfgdir_name, mesh_config_node_func_t cb,
 	return true;
 }
 
-static int del_fobject(const char *fpath, const struct stat *sb, int typeflag,
-						struct FTW *ftwbuf)
-{
-	switch (typeflag) {
-	case FTW_DP:
-		rmdir(fpath);
-		l_debug("RMDIR %s", fpath);
-		break;
-
-	case FTW_SL:
-	default:
-		remove(fpath);
-		l_debug("RM %s", fpath);
-		break;
-	}
-	return 0;
-}
-
-void mesh_config_destroy(struct mesh_config *cfg)
+void mesh_config_destroy_nvm(struct mesh_config *cfg)
 {
 	char *node_dir, *node_name;
 	char uuid[33];
@@ -2359,8 +2337,5 @@ void mesh_config_destroy(struct mesh_config *cfg)
 	if (strcmp(node_name, uuid))
 		return;
 
-	nftw(node_dir, del_fobject, 5, FTW_DEPTH | FTW_PHYS);
-
-	/* Release node config object */
-	mesh_config_release(cfg);
+	del_path(node_dir);
 }

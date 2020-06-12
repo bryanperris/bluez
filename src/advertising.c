@@ -673,7 +673,14 @@ static bool set_flags(struct btd_adv_client *client, uint8_t flags)
 
 	/* Set BR/EDR Not Supported for LE only */
 	if (!btd_adapter_get_bredr(client->manager->adapter))
-		flags |= 0x04;
+		flags |= BT_AD_FLAG_NO_BREDR;
+
+	/* Set BR/EDR Not Supported if adapter is not discoverable but the
+	 * instance is.
+	 */
+	if ((flags & (BT_AD_FLAG_GENERAL | BT_AD_FLAG_LIMITED)) &&
+			!btd_adapter_get_discoverable(client->manager->adapter))
+		flags |= BT_AD_FLAG_NO_BREDR;
 
 	if (!bt_ad_add_flags(client->data, &flags, 1))
 		return false;
@@ -698,7 +705,7 @@ static bool parse_discoverable(DBusMessageIter *iter,
 	dbus_message_iter_get_basic(iter, &discoverable);
 
 	if (discoverable)
-		flags = 0x02;
+		flags = BT_AD_FLAG_GENERAL;
 	else
 		flags = 0x00;
 
@@ -1062,7 +1069,8 @@ static DBusMessage *parse_advertisement(struct btd_adv_client *client)
 		}
 
 		/* Set Limited Discoverable if DiscoverableTimeout is set */
-		if (client->disc_to_id && !set_flags(client, 0x01)) {
+		if (client->disc_to_id &&
+				!set_flags(client, BT_AD_FLAG_LIMITED)) {
 			error("Failed to set Limited Discoverable Flag");
 			goto fail;
 		}

@@ -36,6 +36,9 @@
 #include "mesh/pb-adv.h"
 #include "mesh/mesh.h"
 #include "mesh/agent.h"
+#include "mesh/error.h"
+
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 /* Quick size sanity check */
 static const uint16_t expected_pdu_size[] = {
@@ -77,10 +80,11 @@ enum int_state {
 #define MAT_SECRET	(MAT_REMOTE_PUBLIC | MAT_LOCAL_PRIVATE)
 
 struct mesh_prov_initiator {
-	mesh_prov_initiator_complete_func_t cmplt;
-	mesh_prov_initiator_data_req_func_t get_prov_data;
+	mesh_prov_initiator_start_func_t start_cb;
+	mesh_prov_initiator_complete_func_t complete_cb;
+	mesh_prov_initiator_data_req_func_t data_req_cb;
 	prov_trans_tx_t trans_tx;
-	void *agent;
+	struct mesh_agent *agent;
 	void *caller_data;
 	void *trans_data;
 	struct mesh_node *node;
@@ -102,6 +106,7 @@ struct mesh_prov_initiator {
 	uint8_t private_key[32];
 	uint8_t secret[32];
 	uint8_t rand_auth_workspace[48];
+	uint8_t uuid[16];
 };
 
 static struct mesh_prov_initiator *prov = NULL;
@@ -125,7 +130,7 @@ static void int_prov_close(void *user_data, uint8_t reason)
 	struct mesh_prov_node_info info;
 
 	if (reason != PROV_ERR_SUCCESS) {
-		prov->cmplt(prov->caller_data, reason, NULL);
+		prov->complete_cb(prov->caller_data, reason, NULL);
 		initiator_free();
 		return;
 	}
@@ -135,7 +140,7 @@ static void int_prov_close(void *user_data, uint8_t reason)
 	info.unicast = prov->unicast;
 	info.num_ele = prov->conf_inputs.caps.num_ele;
 
-	prov->cmplt(prov->caller_data, PROV_ERR_SUCCESS, &info);
+	prov->complete_cb(prov->caller_data, PROV_ERR_SUCCESS, &info);
 	initiator_free();
 }
 
@@ -186,7 +191,7 @@ static void int_prov_open(void *user_data, prov_trans_tx_t trans_tx,
 	return;
 }
 
-static void prov_calc_secret(const uint8_t *pub, const uint8_t *priv,
+static bool prov_calc_secret(const uint8_t *pub, const uint8_t *priv,
 							uint8_t *secret)
 {
 	uint8_t tmp[64];
@@ -196,22 +201,27 @@ static void prov_calc_secret(const uint8_t *pub, const uint8_t *priv,
 	swap_u256_bytes(tmp);
 	swap_u256_bytes(tmp + 32);
 
-	ecdh_shared_secret(tmp, priv, secret);
+	if (!ecdh_shared_secret(tmp, priv, secret))
+		return false;
 
 	/* Convert to Mesh byte order */
 	swap_u256_bytes(secret);
+	return true;
 }
 
-static void int_credentials(struct mesh_prov_initiator *prov)
+static bool int_credentials(struct mesh_prov_initiator *prov)
 {
-	prov_calc_secret(prov->conf_inputs.dev_pub_key,
-			prov->private_key, prov->secret);
+	if (!prov_calc_secret(prov->conf_inputs.dev_pub_key,
+				prov->private_key, prov->secret))
+		return false;
 
-	mesh_crypto_s1(&prov->conf_inputs,
-			sizeof(prov->conf_inputs), prov->salt);
+	if (!mesh_crypto_s1(&prov->conf_inputs,
+				sizeof(prov->conf_inputs), prov->salt))
+		return false;
 
-	mesh_crypto_prov_conf_key(prov->secret, prov->salt,
-			prov->calc_key);
+	if (!mesh_crypto_prov_conf_key(prov->secret, prov->salt,
+				prov->calc_key))
+		return false;
 
 	l_getrandom(prov->rand_auth_workspace, 16);
 
@@ -224,6 +234,8 @@ static void int_credentials(struct mesh_prov_initiator *prov)
 	print_packet("LocalRandom", prov->rand_auth_workspace, 16);
 	print_packet("ConfirmationSalt", prov->salt, 16);
 	print_packet("ConfirmationKey", prov->calc_key, 16);
+
+	return true;
 }
 
 static uint8_t u16_high_bit(uint16_t mask)
@@ -320,10 +332,21 @@ static void static_cb(void *user_data, int err, uint8_t *key, uint32_t len)
 	send_confirm(prov);
 }
 
+static void send_pub_key(struct mesh_prov_initiator *prov)
+{
+	struct prov_pub_key_msg msg;
+
+	msg.opcode = PROV_PUB_KEY;
+	memcpy(msg.pub_key, prov->conf_inputs.prv_pub_key, 64);
+	prov->trans_tx(prov->trans_data, &msg, sizeof(msg));
+	prov->state = INT_PROV_KEY_SENT;
+}
+
 static void pub_key_cb(void *user_data, int err, uint8_t *key, uint32_t len)
 {
 	struct mesh_prov_initiator *rx_prov = user_data;
 	struct prov_fail_msg msg;
+	uint8_t fail_code[2];
 
 	if (prov != rx_prov)
 		return;
@@ -338,20 +361,17 @@ static void pub_key_cb(void *user_data, int err, uint8_t *key, uint32_t len)
 	memcpy(prov->conf_inputs.dev_pub_key, key, 64);
 	prov->material |= MAT_REMOTE_PUBLIC;
 
-	if ((prov->material & MAT_SECRET) == MAT_SECRET)
-		int_credentials(prov);
+	if ((prov->material & MAT_SECRET) == MAT_SECRET) {
+		if (!int_credentials(prov)) {
+			fail_code[0] = PROV_FAILED;
+			fail_code[1] = PROV_ERR_UNEXPECTED_ERR;
+			prov->trans_tx(prov->trans_data, fail_code, 2);
+			int_prov_close(prov, fail_code[1]);
+			return;
+		}
+	}
 
-	send_confirm(prov);
-}
-
-static void send_pub_key(struct mesh_prov_initiator *prov)
-{
-	struct prov_pub_key_msg msg;
-
-	msg.opcode = PROV_PUB_KEY;
-	memcpy(msg.pub_key, prov->conf_inputs.prv_pub_key, 64);
-	prov->trans_tx(prov->trans_data, &msg, sizeof(msg));
-	prov->state = INT_PROV_KEY_SENT;
+	send_pub_key(prov);
 }
 
 static void send_random(struct mesh_prov_initiator *prov)
@@ -433,6 +453,179 @@ failure:
 	/* TODO: Call Complete Callback (Fail)*/
 }
 
+static void get_random_key(struct mesh_prov_initiator *prov, uint8_t action,
+								uint8_t size)
+{
+	uint32_t oob_key;
+	int i;
+
+	if (action >= PROV_ACTION_IN_ALPHA) {
+		uint8_t alpha;
+		char tmp[17];
+
+		memset(tmp, 0, sizeof(tmp));
+
+		if (size > 16)
+			size = 16;
+
+		/* Create random alphanumeric string made of 0-9, a-z, A-Z */
+		for (i = 0; i < size; i++) {
+			l_getrandom(&alpha, sizeof(alpha));
+			alpha %= (10 + 26 + 26);
+
+			if (alpha < 10)
+				alpha += '0';
+			else if (alpha < 10 + 26)
+				alpha += 'a' - 10;
+			else
+				alpha += 'A' - 10 - 26;
+
+			tmp[i] = (char) alpha;
+		}
+		memcpy(prov->rand_auth_workspace + 16, tmp, size);
+		memcpy(prov->rand_auth_workspace + 32, tmp, size);
+		return;
+	}
+
+	l_getrandom(&oob_key, sizeof(oob_key));
+
+	if (action <= PROV_ACTION_TWIST)
+		oob_key %= size;
+	else
+		oob_key %= digit_mod(size);
+
+	if (!oob_key)
+		oob_key = size;
+
+	/* Save two copies, for two confirmation values */
+	l_put_be32(oob_key, prov->rand_auth_workspace + 28);
+	l_put_be32(oob_key, prov->rand_auth_workspace + 44);
+}
+
+static void int_prov_auth(void)
+{
+	uint8_t fail_code[2];
+	uint32_t oob_key;
+
+	prov->state = INT_PROV_KEY_ACKED;
+
+	l_debug("auth_method: %d", prov->conf_inputs.start.auth_method);
+	memset(prov->rand_auth_workspace + 16, 0, 32);
+
+	switch (prov->conf_inputs.start.auth_method) {
+	default:
+	case 0:
+		/* Auth Type 3c - No OOB */
+		prov->material |= MAT_RAND_AUTH;
+		break;
+	case 1:
+		/* Auth Type 3c - Static OOB */
+		/* Prompt Agent for Static OOB */
+		fail_code[1] = mesh_agent_request_static(prov->agent,
+				static_cb, prov);
+
+		if (fail_code[1])
+			goto failure;
+
+		break;
+	case 2:
+		/* Auth Type 3a - Output OOB */
+		/* Prompt Agent for Output OOB */
+		if (prov->conf_inputs.start.auth_action ==
+						PROV_ACTION_OUT_ALPHA) {
+			fail_code[1] = mesh_agent_prompt_alpha(
+				prov->agent, true,
+				static_cb, prov);
+		} else {
+			fail_code[1] = mesh_agent_prompt_number(
+				prov->agent, true,
+				prov->conf_inputs.start.auth_action,
+				number_cb, prov);
+		}
+
+		if (fail_code[1])
+			goto failure;
+
+		break;
+
+	case 3:
+		/* Auth Type 3b - input OOB */
+		get_random_key(prov,
+				prov->conf_inputs.start.auth_action,
+				prov->conf_inputs.start.auth_size);
+		oob_key = l_get_be32(prov->rand_auth_workspace + 28);
+
+		/* Ask Agent to Display random key */
+		if (prov->conf_inputs.start.auth_action ==
+						PROV_ACTION_IN_ALPHA) {
+
+			fail_code[1] = mesh_agent_display_string(
+				prov->agent,
+				(char *) prov->rand_auth_workspace + 16,
+				NULL, prov);
+		} else {
+			fail_code[1] = mesh_agent_display_number(
+				prov->agent, true,
+				prov->conf_inputs.start.auth_action,
+				oob_key, NULL, prov);
+		}
+
+		if (fail_code[1])
+			goto failure;
+
+		break;
+
+	}
+
+	if (prov->material & MAT_RAND_AUTH)
+		send_confirm(prov);
+
+	return;
+
+failure:
+	l_debug("Failing... %d", fail_code[1]);
+	fail_code[0] = PROV_FAILED;
+	prov->trans_tx(prov->trans_data, fail_code, 2);
+	int_prov_close(prov, fail_code[1]);
+}
+
+static void int_prov_start_auth(const struct mesh_agent_prov_caps *prov_caps,
+				const struct mesh_net_prov_caps *dev_caps,
+				struct prov_start *start)
+{
+	uint8_t pub_type = prov_caps->pub_type & dev_caps->pub_type;
+	uint8_t static_type = prov_caps->static_type & dev_caps->static_type;
+	uint16_t output_action = prov_caps->output_action &
+					L_BE16_TO_CPU(dev_caps->output_action);
+	uint8_t output_size = MIN(prov_caps->output_size,
+							dev_caps->output_size);
+	uint16_t input_action = prov_caps->input_action &
+					L_BE16_TO_CPU(dev_caps->input_action);
+	uint8_t input_size = MIN(prov_caps->input_size, dev_caps->input_size);
+
+	if (pub_type)
+		start->pub_key = 0x01;
+
+	/* Parse OOB Options, prefer static, then out, then in */
+	if (static_type) {
+		start->auth_method = 0x01;
+		return;
+	}
+
+	if (output_size && output_action) {
+		start->auth_method = 0x02;
+		start->auth_action = u16_high_bit(output_action);
+		start->auth_size = MIN(output_size, 8);
+		return;
+	}
+
+	if (input_size && input_action) {
+		start->auth_method = 0x03;
+		start->auth_action = u16_high_bit(input_action);
+		start->auth_size = MIN(input_size, 8);
+		return;
+	}
+}
 
 static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 {
@@ -440,7 +633,6 @@ static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 	uint8_t *out;
 	uint8_t type = *data++;
 	uint8_t fail_code[2];
-	uint32_t oob_key;
 
 	if (rx_prov != prov || !prov->trans_tx)
 		return;
@@ -486,42 +678,22 @@ static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 			goto failure;
 		}
 
-		/* If Public Key available Out of Band, use it */
-		if (prov->conf_inputs.caps.pub_type) {
-			prov->conf_inputs.start.pub_key = 0x01;
+		/*
+		 * Select auth mechanism from methods supported by both
+		 * parties.
+		 */
+		int_prov_start_auth(mesh_agent_get_caps(prov->agent),
+						&prov->conf_inputs.caps,
+						&prov->conf_inputs.start);
+
+		if (prov->conf_inputs.start.pub_key == 0x01) {
 			prov->expected = PROV_CONFIRM;
 			/* Prompt Agent for remote Public Key */
 			mesh_agent_request_public_key(prov->agent,
 							pub_key_cb, prov);
-
 			/* Nothing else for us to do now */
 		} else
 			prov->expected = PROV_PUB_KEY;
-
-		/* Parse OOB Options, prefer static, then out, then in */
-		if (prov->conf_inputs.caps.static_type) {
-
-			prov->conf_inputs.start.auth_method = 0x01;
-
-		} else if (prov->conf_inputs.caps.output_size &&
-				prov->conf_inputs.caps.output_action) {
-
-			prov->conf_inputs.start.auth_method = 0x02;
-			prov->conf_inputs.start.auth_action =
-					u16_high_bit(l_get_be16(data + 6));
-			prov->conf_inputs.start.auth_size =
-						(data[5] > 8 ? 8 : data[5]);
-
-		} else if (prov->conf_inputs.caps.input_size &&
-				prov->conf_inputs.caps.input_action) {
-
-			prov->conf_inputs.start.auth_method = 0x03;
-			prov->conf_inputs.start.auth_action =
-					u16_high_bit(l_get_be16(data + 9));
-			prov->conf_inputs.start.auth_size =
-						(data[8] > 8 ? 8 : data[8]);
-
-		}
 
 		out = l_malloc(1 + sizeof(prov->conf_inputs.start));
 		out[0] = PROV_START;
@@ -548,83 +720,17 @@ static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 		if ((prov->material & MAT_SECRET) != MAT_SECRET)
 			return;
 
-		int_credentials(prov);
-		prov->state = INT_PROV_KEY_ACKED;
-
-		l_debug("auth_method: %d", prov->conf_inputs.start.auth_method);
-		memset(prov->rand_auth_workspace + 16, 0, 32);
-		switch (prov->conf_inputs.start.auth_method) {
-		default:
-		case 0:
-			/* Auth Type 3c - No OOB */
-			prov->material |= MAT_RAND_AUTH;
-			break;
-		case 1:
-			/* Auth Type 3c - Static OOB */
-			/* Prompt Agent for Static OOB */
-			fail_code[1] = mesh_agent_request_static(prov->agent,
-					static_cb, prov);
-
-			if (fail_code[1])
-				goto failure;
-
-			break;
-		case 2:
-			/* Auth Type 3a - Output OOB */
-			/* Prompt Agent for Output OOB */
-			if (prov->conf_inputs.start.auth_action ==
-							PROV_ACTION_OUT_ALPHA) {
-				fail_code[1] = mesh_agent_prompt_alpha(
-					prov->agent,
-					static_cb, prov);
-			} else {
-				fail_code[1] = mesh_agent_prompt_number(
-					prov->agent, true,
-					prov->conf_inputs.start.auth_action,
-					number_cb, prov);
-			}
-
-			if (fail_code[1])
-				goto failure;
-
-			break;
-
-		case 3:
-			/* Auth Type 3b - input OOB */
-			l_getrandom(&oob_key, sizeof(oob_key));
-			oob_key %= digit_mod(prov->conf_inputs.start.auth_size);
-
-			/* Save two copies, for two confirmation values */
-			l_put_be32(oob_key, prov->rand_auth_workspace + 28);
-			l_put_be32(oob_key, prov->rand_auth_workspace + 44);
-			prov->material |= MAT_RAND_AUTH;
-			/* Ask Agent to Display U32 */
-			if (prov->conf_inputs.start.auth_action ==
-							PROV_ACTION_IN_ALPHA) {
-				/* TODO: Construst NUL-term string to pass */
-				fail_code[1] = mesh_agent_display_string(
-					prov->agent, NULL, NULL, prov);
-			} else {
-				fail_code[1] = mesh_agent_display_number(
-					prov->agent, false,
-					prov->conf_inputs.start.auth_action,
-					oob_key, NULL, prov);
-			}
-
-			if (fail_code[1])
-				goto failure;
-
-			break;
-
+		if (!int_credentials(prov)) {
+			fail_code[1] = PROV_ERR_UNEXPECTED_ERR;
+			goto failure;
 		}
 
-		if (prov->material & MAT_RAND_AUTH)
-			send_confirm(prov);
-
+		int_prov_auth();
 		break;
 
 	case PROV_INP_CMPLT: /* Provisioning Input Complete */
 		/* TODO: Cancel Agent prompt */
+		prov->material |= MAT_RAND_AUTH;
 		send_confirm(prov);
 		break;
 
@@ -655,7 +761,7 @@ static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 			goto failure;
 		}
 
-		if (!prov->get_prov_data(prov->caller_data,
+		if (!prov->data_req_cb(prov->caller_data,
 					prov->conf_inputs.caps.num_ele)) {
 			l_error("Provisioning Failed-Data Get");
 			fail_code[1] = PROV_ERR_CANT_ASSIGN_ADDR;
@@ -664,7 +770,7 @@ static void int_prov_rx(void *user_data, const uint8_t *data, uint16_t len)
 		break;
 
 	case PROV_COMPLETE: /* Complete */
-		l_info("Provisioning Complete");
+		l_debug("Provisioning Complete");
 		prov->state = INT_PROV_IDLE;
 		int_prov_close(prov, PROV_ERR_SUCCESS);
 		break;
@@ -703,7 +809,7 @@ static void int_prov_ack(void *user_data, uint8_t msg_num)
 	switch (prov->state) {
 	case INT_PROV_START_SENT:
 		prov->state = INT_PROV_START_ACKED;
-		if (prov->conf_inputs.caps.pub_type == 0)
+		if (!prov->conf_inputs.start.pub_key)
 			send_pub_key(prov);
 		break;
 
@@ -711,11 +817,15 @@ static void int_prov_ack(void *user_data, uint8_t msg_num)
 		prov->state = INT_PROV_DATA_ACKED;
 		break;
 
+	case INT_PROV_KEY_SENT:
+		if (prov->conf_inputs.start.pub_key)
+			int_prov_auth();
+		break;
+
 	case INT_PROV_IDLE:
 	case INT_PROV_INVITE_SENT:
 	case INT_PROV_INVITE_ACKED:
 	case INT_PROV_START_ACKED:
-	case INT_PROV_KEY_SENT:
 	case INT_PROV_KEY_ACKED:
 	case INT_PROV_CONF_SENT:
 	case INT_PROV_CONF_ACKED:
@@ -727,18 +837,45 @@ static void int_prov_ack(void *user_data, uint8_t msg_num)
 	}
 }
 
-bool initiator_start(enum trans_type transport,
-		uint8_t uuid[16],
-		uint16_t max_ele,
-		uint16_t server, /* Only valid for PB-Remote */
-		uint32_t timeout, /* in seconds from mesh.conf */
-		struct mesh_agent *agent,
-		mesh_prov_initiator_data_req_func_t get_prov_data,
-		mesh_prov_initiator_complete_func_t complete_cb,
-		void *node, void *caller_data)
+static void initiator_open_cb(void *user_data, int err)
 {
 	bool result;
 
+	if (!prov)
+		return;
+
+	if (err != MESH_ERROR_NONE)
+		goto fail;
+
+	/* Always register for PB-ADV */
+	result = pb_adv_reg(true, int_prov_open, int_prov_close, int_prov_rx,
+						int_prov_ack, prov->uuid, prov);
+
+	if (!result) {
+		err = MESH_ERROR_FAILED;
+		goto fail;
+	}
+
+	if (!prov)
+		return;
+
+	prov->start_cb(prov->caller_data, MESH_ERROR_NONE);
+	return;
+fail:
+	prov->start_cb(prov->caller_data, err);
+	initiator_free();
+}
+
+bool initiator_start(enum trans_type transport,
+		uint8_t uuid[16],
+		uint16_t max_ele,
+		uint32_t timeout, /* in seconds from mesh.conf */
+		struct mesh_agent *agent,
+		mesh_prov_initiator_start_func_t start_cb,
+		mesh_prov_initiator_data_req_func_t data_req_cb,
+		mesh_prov_initiator_complete_func_t complete_cb,
+		void *node, void *caller_data)
+{
 	/* Invoked from Add() method in mesh-api.txt, to add a
 	 * remote unprovisioned device network.
 	 */
@@ -750,20 +887,16 @@ bool initiator_start(enum trans_type transport,
 	prov->to_secs = timeout;
 	prov->node = node;
 	prov->agent = agent;
-	prov->cmplt = complete_cb;
-	prov->get_prov_data = get_prov_data;
+	prov->complete_cb = complete_cb;
+	prov->start_cb = start_cb;
+	prov->data_req_cb = data_req_cb;
 	prov->caller_data = caller_data;
 	prov->previous = -1;
+	memcpy(prov->uuid, uuid, 16);
 
-	/* Always register for PB-ADV */
-	result = pb_adv_reg(true, int_prov_open, int_prov_close, int_prov_rx,
-						int_prov_ack, uuid, prov);
+	mesh_agent_refresh(prov->agent, initiator_open_cb, prov);
 
-	if (result)
-		return true;
-
-	initiator_free();
-	return false;
+	return true;
 }
 
 void initiator_cancel(void *user_data)

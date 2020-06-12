@@ -101,7 +101,8 @@ struct mgmt_rp_read_index_list {
 #define MGMT_SETTING_PRIVACY		0x00002000
 #define MGMT_SETTING_CONFIGURATION	0x00004000
 #define MGMT_SETTING_STATIC_ADDRESS	0x00008000
-#define MGMT_SETTING_PHY_CONFIGURATION 0x00010000
+#define MGMT_SETTING_PHY_CONFIGURATION	0x00010000
+#define MGMT_SETTING_WIDEBAND_SPEECH	0x00020000
 
 #define MGMT_OP_READ_INFO		0x0004
 struct mgmt_rp_read_info {
@@ -583,6 +584,103 @@ struct mgmt_cp_set_phy_confguration {
 	uint32_t	selected_phys;
 } __packed;
 
+#define MGMT_OP_SET_BLOCKED_KEYS	0x0046
+
+#define MGMT_OP_SET_WIDEBAND_SPEECH	0x0047
+
+#define HCI_BLOCKED_KEY_TYPE_LINKKEY	0x00
+#define HCI_BLOCKED_KEY_TYPE_LTK	0x01
+#define HCI_BLOCKED_KEY_TYPE_IRK	0x02
+
+struct mgmt_blocked_key_info {
+	uint8_t type;
+	uint8_t val[16];
+} __packed;
+
+struct mgmt_cp_set_blocked_keys {
+	uint16_t key_count;
+	struct mgmt_blocked_key_info keys[0];
+} __packed;
+
+#define MGMT_OP_READ_SECURITY_INFO	0x0048
+struct mgmt_rp_read_security_info {
+	uint16_t sec_len;
+	uint8_t  sec[0];
+} __packed;
+
+#define MGMT_OP_READ_EXP_FEATURES_INFO	0x0049
+struct mgmt_rp_read_exp_features_info {
+	uint16_t feature_count;
+	struct {
+		uint8_t  uuid[16];
+		uint32_t flags;
+	} features[];
+} __packed;
+
+#define MGMT_OP_SET_EXP_FEATURE		0x004a
+struct mgmt_cp_set_exp_feature {
+	uint8_t  uuid[16];
+	uint8_t  action;
+} __packed;
+#define MGMT_SET_EXP_FEATURE_SIZE	17
+struct mgmt_rp_set_exp_feature {
+	uint8_t  uuid[16];
+	uint32_t flags;
+} __packed;
+
+#define MGMT_OP_READ_DEFAULT_SYSTEM_PARAMETERS	0x004b
+
+struct mgmt_system_parameter_tlv {
+	uint16_t type;
+	uint8_t  length;
+	uint8_t  value[];
+} __packed;
+
+struct mgmt_rp_read_default_system_parameters {
+	uint8_t  parameters[0]; /* mgmt_system_parameter_tlv */
+} __packed;
+
+#define MGMT_OP_SET_DEFAULT_SYSTEM_PARAMETERS	0x004c
+
+struct mgmt_cp_set_default_system_parameters {
+	uint8_t  parameters[0]; /* mgmt_system_parameter_tlv */
+} __packed;
+
+#define MGMT_ADV_MONITOR_FEATURE_MASK_OR_PATTERNS	(1 << 0)
+
+#define MGMT_OP_READ_ADV_MONITOR_FEATURES	0x0051
+struct mgmt_rp_read_adv_monitor_features {
+	uint32_t supported_features;
+	uint32_t enabled_features;
+	uint16_t max_num_handles;
+	uint8_t max_num_patterns;
+	uint16_t num_handles;
+	uint16_t handles[0];
+}  __packed;
+
+struct mgmt_adv_pattern {
+	uint8_t ad_type;
+	uint8_t offset;
+	uint8_t length;
+	uint8_t value[31];
+} __packed;
+
+#define MGMT_OP_ADD_ADV_MONITOR			0x0052
+struct mgmt_cp_add_adv_monitor {
+	uint8_t pattern_count;
+	struct mgmt_adv_pattern patterns[0];
+} __packed;
+struct mgmt_rp_add_adv_patterns_monitor {
+	uint16_t monitor_handle;
+} __packed;
+
+#define MGMT_OP_REMOVE_ADV_MONITOR		0x0053
+struct mgmt_cp_remove_adv_monitor {
+	uint16_t monitor_handle;
+} __packed;
+struct mgmt_rp_remove_adv_monitor {
+	uint16_t monitor_handle;
+} __packed;
 
 #define MGMT_EV_CMD_COMPLETE		0x0001
 struct mgmt_ev_cmd_complete {
@@ -807,6 +905,22 @@ struct mgmt_ev_phy_configuration_changed {
 	uint16_t	selected_phys;
 } __packed;
 
+#define MGMT_EV_EXP_FEATURE_CHANGE	0x0027
+struct mgmt_ev_exp_feature_changed {
+	uint8_t  uuid[16];
+	uint32_t flags;
+} __packed;
+
+#define MGMT_EV_ADV_MONITOR_ADDED	0x002b
+struct mgmt_ev_adv_monitor_added {
+	uint16_t monitor_handle;
+}  __packed;
+
+#define MGMT_EV_ADV_MONITOR_REMOVED	0x002c
+struct mgmt_ev_adv_monitor_removed {
+	uint16_t monitor_handle;
+}  __packed;
+
 static const char *mgmt_op[] = {
 	"<0x0000>",
 	"Read Version",
@@ -878,6 +992,16 @@ static const char *mgmt_op[] = {
 	"Set Appearance",
 	"Get PHY Configuration",
 	"Set PHY Configuration",
+	"Set Blocked Keys",
+	"Set Wideband Speech",
+	"Read Security Information",			/* 0x0048 */
+	"Read Experimental Features Information",
+	"Set Experimental Feature",
+	"Read Default System Configuration",
+	"Set Default System Configuration",
+	"Read Advertisement Monitor Features",
+	"Add Advertisement Monitor",
+	"Remove Advertisement Monitor",
 };
 
 static const char *mgmt_ev[] = {
@@ -920,6 +1044,9 @@ static const char *mgmt_ev[] = {
 	"Advertising Removed",
 	"Extended Controller Information Changed",
 	"PHY Configuration Changed",
+	"Experimental Feature Changed",
+	"Advertisement Monitor Added",			/* 0x002b */
+	"Advertisement Monitor Removed",
 };
 
 static const char *mgmt_status[] = {

@@ -1161,10 +1161,12 @@ failed:
 	return FALSE;
 }
 
-static int uinput_create(char *name)
+static int uinput_create(struct btd_device *device, const char *name,
+			 const char *suffix)
 {
 	struct uinput_dev dev;
 	int fd, err, i;
+	char src[18];
 
 	fd = open("/dev/uinput", O_RDWR);
 	if (fd < 0) {
@@ -1181,13 +1183,34 @@ static int uinput_create(char *name)
 	}
 
 	memset(&dev, 0, sizeof(dev));
-	if (name)
-		strncpy(dev.name, name, UINPUT_MAX_NAME_SIZE - 1);
+
+	if (name) {
+		strncpy(dev.name, name, UINPUT_MAX_NAME_SIZE);
+		dev.name[UINPUT_MAX_NAME_SIZE - 1] = '\0';
+	}
+
+	if (suffix) {
+		int len, slen;
+
+		len = strlen(dev.name);
+		slen = strlen(suffix);
+
+		/* If name + suffix don't fit, truncate the name, then add the
+		 * suffix.
+		 */
+		if (len + slen < UINPUT_MAX_NAME_SIZE - 1) {
+			strcpy(dev.name + len, suffix);
+		} else {
+			len = UINPUT_MAX_NAME_SIZE - slen - 1;
+			strncpy(dev.name + len, suffix, slen);
+			dev.name[UINPUT_MAX_NAME_SIZE - 1] = '\0';
+		}
+	}
 
 	dev.id.bustype = BUS_BLUETOOTH;
-	dev.id.vendor  = 0x0000;
-	dev.id.product = 0x0000;
-	dev.id.version = 0x0000;
+	dev.id.vendor  = btd_device_get_vendor(device);
+	dev.id.product = btd_device_get_product(device);
+	dev.id.version = btd_device_get_version(device);
 
 	if (write(fd, &dev, sizeof(dev)) < 0) {
 		err = -errno;
@@ -1201,6 +1224,9 @@ static int uinput_create(char *name)
 	ioctl(fd, UI_SET_EVBIT, EV_REL);
 	ioctl(fd, UI_SET_EVBIT, EV_REP);
 	ioctl(fd, UI_SET_EVBIT, EV_SYN);
+
+	ba2strlc(btd_adapter_get_address(device_get_adapter(device)), src);
+	ioctl(fd, UI_SET_PHYS, src);
 
 	for (i = 0; key_map[i].name != NULL; i++)
 		ioctl(fd, UI_SET_KEYBIT, key_map[i].uinput);
@@ -1220,7 +1246,7 @@ static int uinput_create(char *name)
 
 static void init_uinput(struct avctp *session)
 {
-	char address[18], name[248 + 1];
+	char name[UINPUT_MAX_NAME_SIZE];
 
 	device_get_name(session->device, name, sizeof(name));
 	if (g_str_equal(name, "Nokia CK-20W")) {
@@ -1230,12 +1256,11 @@ static void init_uinput(struct avctp *session)
 		session->key_quirks[AVC_PAUSE] |= QUIRK_NO_RELEASE;
 	}
 
-	ba2str(device_get_address(session->device), address);
-	session->uinput = uinput_create(address);
+	session->uinput = uinput_create(session->device, name, " (AVRCP)");
 	if (session->uinput < 0)
-		error("AVRCP: failed to init uinput for %s", address);
+		error("AVRCP: failed to init uinput for %s", name);
 	else
-		DBG("AVRCP: uinput initialized for %s", address);
+		DBG("AVRCP: uinput initialized for %s", name);
 }
 
 static struct avctp_queue *avctp_queue_create(struct avctp_channel *chan)
@@ -1625,13 +1650,13 @@ int avctp_register(struct btd_adapter *adapter, gboolean master)
 
 	server = g_new0(struct avctp_server, 1);
 
-	server->control_io = avctp_server_socket(src, master, L2CAP_MODE_BASIC,
+	server->control_io = avctp_server_socket(src, master, BT_IO_MODE_BASIC,
 							AVCTP_CONTROL_PSM);
 	if (!server->control_io) {
 		g_free(server);
 		return -1;
 	}
-	server->browsing_io = avctp_server_socket(src, master, L2CAP_MODE_ERTM,
+	server->browsing_io = avctp_server_socket(src, master, BT_IO_MODE_ERTM,
 							AVCTP_BROWSING_PSM);
 	if (!server->browsing_io) {
 		if (server->control_io) {
@@ -2165,7 +2190,7 @@ int avctp_connect_browsing(struct avctp *session)
 				device_get_address(session->device),
 				BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_MEDIUM,
 				BT_IO_OPT_PSM, AVCTP_BROWSING_PSM,
-				BT_IO_OPT_MODE, L2CAP_MODE_ERTM,
+				BT_IO_OPT_MODE, BT_IO_MODE_ERTM,
 				BT_IO_OPT_INVALID);
 	if (err) {
 		error("%s", err->message);
@@ -2196,4 +2221,15 @@ struct avctp *avctp_get(struct btd_device *device)
 bool avctp_is_initiator(struct avctp *session)
 {
 	return session->initiator;
+}
+
+bool avctp_supports_avc(uint8_t avc)
+{
+	int i;
+
+	for (i = 0; key_map[i].name != NULL; i++) {
+		if (key_map[i].avc == avc)
+			return true;
+	}
+	return false;
 }

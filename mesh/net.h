@@ -31,7 +31,6 @@ struct mesh_node;
 #define APP_AID_DEV	0x00
 
 #define CTL		0x80
-#define SEQ_MASK	0xffffff
 
 #define CREDFLAG_MASK	0x1000
 
@@ -40,8 +39,9 @@ struct mesh_node;
 
 #define MAX_UNSEG_LEN	15 /* msg_len == 11 + sizeof(MIC) */
 #define MAX_SEG_LEN	12 /* UnSeg length - 3 octets overhead */
-#define SEG_MAX(len)	(((len) <= MAX_UNSEG_LEN) ? 0 : \
+#define SEG_MAX(seg, len) ((!seg && len <= MAX_UNSEG_LEN) ? 0 : \
 						(((len) - 1) / MAX_SEG_LEN))
+
 #define SEG_OFF(seg)	((seg) * MAX_SEG_LEN)
 #define MAX_SEG_TO_LEN(seg)	((seg) ? SEG_OFF((seg) + 1) : MAX_UNSEG_LEN)
 
@@ -117,11 +117,8 @@ struct mesh_node;
 #define FRND_OPCODE(x) \
 		((x) >= NET_OP_FRND_POLL && (x) <= NET_OP_FRND_CLEAR_CONFIRM)
 
-struct mesh_net_addr_range {
-	uint16_t low;
-	uint16_t high;
-	uint16_t next;
-};
+#define DEFAULT_MIN_DELAY		0
+#define DEFAULT_MAX_DELAY		25
 
 struct mesh_net_prov_caps {
 	uint8_t num_ele;
@@ -162,25 +159,40 @@ struct mesh_key_set {
 	uint8_t privacy_key[16];
 };
 
+struct friend_neg {
+	int8_t rssi;
+	bool clearing;
+};
+
+struct friend_act {
+	uint16_t *grp_list;
+	uint32_t last_hdr;
+	int16_t grp_cnt;
+	bool seq;
+	bool last;
+};
+
 struct mesh_friend {
 	struct mesh_net *net;
-	struct l_queue *pkt_cache;
 	struct l_timeout *timeout;
+	struct l_queue *pkt_cache;
 	void *pkt;
-	uint16_t *grp_list;
 	uint32_t poll_timeout;
-	uint32_t last_hdr;
 	uint32_t net_key_cur;
 	uint32_t net_key_upd;
-	uint16_t dst; /* Primary Element unicast addr */
+	uint16_t old_friend;
+	uint16_t net_idx;
+	uint16_t lp_addr;/* dst; * Primary Element unicast addr */
 	uint16_t fn_cnt;
 	uint16_t lp_cnt;
-	int16_t grp_cnt;
+	uint8_t	receive_delay;
 	uint8_t ele_cnt;
 	uint8_t frd;
 	uint8_t frw;
-	bool seq;
-	bool last;
+	union {
+		struct friend_neg negotiate;
+		struct friend_act active;
+	} u;
 };
 
 struct mesh_frnd_pkt {
@@ -242,13 +254,10 @@ struct mesh_friend_msg {
 };
 
 typedef void (*mesh_status_func_t)(void *user_data, bool result);
-typedef void (*mesh_net_status_func_t)(uint16_t remote, uint8_t status,
-					void *data, uint16_t size,
-					void *user_data);
 
 struct mesh_net *mesh_net_new(struct mesh_node *node);
-void mesh_net_free(struct mesh_net *net);
-void mesh_net_flush_msg_queues(struct mesh_net *net);
+void mesh_net_free(void *net);
+void mesh_net_cleanup(void);
 void mesh_net_set_iv_index(struct mesh_net *net, uint32_t index, bool update);
 bool mesh_net_iv_index_update(struct mesh_net *net);
 bool mesh_net_set_seq_num(struct mesh_net *net, uint32_t number);
@@ -261,9 +270,8 @@ void mesh_net_set_frnd_seq(struct mesh_net *net, bool seq);
 uint16_t mesh_net_get_address(struct mesh_net *net);
 bool mesh_net_register_unicast(struct mesh_net *net,
 					uint16_t unicast, uint8_t num_ele);
-bool mesh_net_set_friend(struct mesh_net *net, uint16_t friend_addr);
-uint16_t mesh_net_get_friend(struct mesh_net *net);
 uint8_t mesh_net_get_num_ele(struct mesh_net *net);
+void net_local_beacon(uint32_t key_id, uint8_t *beacon);
 bool mesh_net_set_beacon_mode(struct mesh_net *net, bool enable);
 bool mesh_net_set_proxy_mode(struct mesh_net *net, bool enable);
 bool mesh_net_set_relay_mode(struct mesh_net *net, bool enable, uint8_t cnt,
@@ -285,33 +293,24 @@ bool mesh_net_attach(struct mesh_net *net, struct mesh_io *io);
 struct mesh_io *mesh_net_detach(struct mesh_net *net);
 struct l_queue *mesh_net_get_app_keys(struct mesh_net *net);
 
-bool mesh_net_flush(struct mesh_net *net);
 void mesh_net_transport_send(struct mesh_net *net, uint32_t key_id,
-				bool fast, uint32_t iv_index, uint8_t ttl,
-				uint32_t seq, uint16_t src, uint16_t dst,
-				const uint8_t *msg, uint16_t msg_len);
+				uint16_t net_idx, uint32_t iv_index,
+				uint8_t ttl, uint32_t seq, uint16_t src,
+				uint16_t dst, const uint8_t *msg,
+				uint16_t msg_len);
 
 bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 				uint16_t dst, uint8_t key_id, uint16_t net_idx,
 				uint8_t ttl, uint32_t seq, uint32_t iv_index,
-				bool szmic, const void *msg, uint16_t msg_len,
-				mesh_net_status_func_t status_func,
-				void *user_data);
+				bool segmented, bool szmic, const void *msg,
+				uint16_t msg_len);
 void mesh_net_ack_send(struct mesh_net *net, uint32_t key_id,
 				uint32_t iv_index, uint8_t ttl, uint32_t seq,
 				uint16_t src, uint16_t dst, bool rly,
 				uint16_t seqZero, uint32_t ack_flags);
-struct mesh_net_prov_caps *mesh_net_prov_caps_get(struct mesh_net *net);
-uint8_t *mesh_net_priv_key_get(struct mesh_net *net);
-bool mesh_net_priv_key_set(struct mesh_net *net, uint8_t key[32]);
-uint8_t *mesh_net_prov_rand(struct mesh_net *net);
-uint16_t mesh_net_prov_uni(struct mesh_net *net, uint8_t ele_cnt);
-bool mesh_net_id_uuid_set(struct mesh_net *net, uint8_t uuid[16]);
-uint8_t *mesh_net_test_addr(struct mesh_net *net);
 int mesh_net_get_identity_mode(struct mesh_net *net, uint16_t idx,
 								uint8_t *mode);
 char *mesh_net_id_name(struct mesh_net *net);
-bool mesh_net_test_mode(struct mesh_net *net);
 bool mesh_net_dst_reg(struct mesh_net *net, uint16_t dst);
 bool mesh_net_dst_unreg(struct mesh_net *net, uint16_t dst);
 struct mesh_friend *mesh_friend_new(struct mesh_net *net, uint16_t dst,
@@ -333,26 +332,17 @@ void mesh_net_send_seg(struct mesh_net *net, uint32_t key_id,
 				uint32_t iv_index, uint8_t ttl, uint32_t seq,
 				uint16_t src, uint16_t dst, uint32_t hdr,
 				const void *seg, uint16_t seg_len);
-uint16_t mesh_net_get_features(struct mesh_net *net);
 struct mesh_net_heartbeat *mesh_net_heartbeat_get(struct mesh_net *net);
 void mesh_net_heartbeat_init(struct mesh_net *net);
 void mesh_net_heartbeat_send(struct mesh_net *net);
-void mesh_net_uni_range_set(struct mesh_net *net,
-				struct mesh_net_addr_range *range);
-struct mesh_net_addr_range mesh_net_uni_range_get(struct mesh_net *net);
-void mesh_net_provisioner_mode_set(struct mesh_net *net, bool mode);
-bool mesh_net_provisioner_mode_get(struct mesh_net *net);
 bool mesh_net_key_list_get(struct mesh_net *net, uint8_t *buf, uint16_t *count);
 uint16_t mesh_net_get_primary_idx(struct mesh_net *net);
-void mesh_net_sub_list_add(struct mesh_net *net, uint16_t addr);
-void mesh_net_sub_list_del(struct mesh_net *net, uint16_t addr);
 uint32_t mesh_net_friend_timeout(struct mesh_net *net, uint16_t addr);
 struct mesh_io *mesh_net_get_io(struct mesh_net *net);
 struct mesh_node *mesh_net_node_get(struct mesh_net *net);
 bool mesh_net_have_key(struct mesh_net *net, uint16_t net_idx);
 bool mesh_net_is_local_address(struct mesh_net *net, uint16_t src,
 							uint16_t count);
-void mesh_net_set_window_accuracy(struct mesh_net *net, uint8_t accuracy);
 void mesh_net_transmit_params_set(struct mesh_net *net, uint8_t count,
 							uint16_t interval);
 void mesh_net_transmit_params_get(struct mesh_net *net, uint8_t *count,
@@ -360,3 +350,9 @@ void mesh_net_transmit_params_get(struct mesh_net *net, uint8_t *count,
 struct mesh_prov *mesh_net_get_prov(struct mesh_net *net);
 void mesh_net_set_prov(struct mesh_net *net, struct mesh_prov *prov);
 uint32_t mesh_net_get_instant(struct mesh_net *net);
+struct l_queue *mesh_net_get_friends(struct mesh_net *net);
+struct l_queue *mesh_net_get_negotiations(struct mesh_net *net);
+bool net_msg_check_replay_cache(struct mesh_net *net, uint16_t src,
+				uint16_t crpl, uint32_t seq, uint32_t iv_index);
+void net_msg_add_replay_cache(struct mesh_net *net, uint16_t src, uint32_t seq,
+							uint32_t iv_index);

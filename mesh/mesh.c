@@ -27,6 +27,7 @@
 #include "mesh/mesh-io.h"
 #include "mesh/node.h"
 #include "mesh/net.h"
+#include "mesh/net-keys.h"
 #include "mesh/provision.h"
 #include "mesh/model.h"
 #include "mesh/dbus.h"
@@ -37,12 +38,13 @@
 
 /*
  * The default values for mesh configuration. Can be
- * overwritten by values from mesh.conf
+ * overwritten by values from mesh-main.conf
  */
 #define DEFAULT_PROV_TIMEOUT 60
-#define DEFAULT_ALGORITHMS 0x0001
+#define DEFAULT_CRPL 100
+#define DEFAULT_FRIEND_QUEUE_SZ 32
 
-/* TODO: add more default values */
+#define DEFAULT_ALGORITHMS 0x0001
 
 struct scan_filter {
 	uint8_t id;
@@ -55,22 +57,44 @@ struct bt_mesh {
 	prov_rx_cb_t prov_rx;
 	void *prov_data;
 	uint32_t prov_timeout;
+	bool beacon_enabled;
+	bool friend_support;
+	bool relay_support;
+	bool lpn_support;
+	bool proxy_support;
+	uint16_t crpl;
 	uint16_t algorithms;
 	uint16_t req_index;
+	uint8_t friend_queue_sz;
 	uint8_t max_filters;
+	bool initialized;
 };
 
 struct join_data{
 	struct l_dbus_message *msg;
-	struct mesh_agent *agent;
-	const char *sender;
-	const char *app_path;
+	char *sender;
 	struct mesh_node *node;
 	uint32_t disc_watch;
 	uint8_t *uuid;
 };
 
-static struct bt_mesh mesh;
+struct mesh_init_request {
+	mesh_ready_func_t cb;
+	void *user_data;
+};
+
+static struct bt_mesh mesh = {
+	.algorithms = DEFAULT_ALGORITHMS,
+	.prov_timeout = DEFAULT_PROV_TIMEOUT,
+	.beacon_enabled = true,
+	.friend_support = true,
+	.relay_support = true,
+	.lpn_support = false,
+	.proxy_support = false,
+	.crpl = DEFAULT_CRPL,
+	.friend_queue_sz = DEFAULT_FRIEND_QUEUE_SZ,
+	.initialized = false
+};
 
 /* We allow only one outstanding Join request */
 static struct join_data *join_pending;
@@ -118,29 +142,124 @@ static void prov_rx(void *user_data, struct mesh_io_recv_info *info,
 
 bool mesh_reg_prov_rx(prov_rx_cb_t cb, void *user_data)
 {
+	uint8_t prov_filter[] = {MESH_AD_TYPE_PROVISION};
+
 	if (mesh.prov_rx && mesh.prov_rx != cb)
 		return false;
 
 	mesh.prov_rx = cb;
 	mesh.prov_data = user_data;
 
-	return mesh_io_register_recv_cb(mesh.io, MESH_IO_FILTER_PROV,
-							prov_rx, &mesh);
+	return mesh_io_register_recv_cb(mesh.io, prov_filter,
+					sizeof(prov_filter), prov_rx, &mesh);
 }
 
 void mesh_unreg_prov_rx(prov_rx_cb_t cb)
 {
+	uint8_t prov_filter[] = {MESH_AD_TYPE_PROVISION};
+
 	if (mesh.prov_rx != cb)
 		return;
 
 	mesh.prov_rx = NULL;
 	mesh.prov_data = NULL;
-	mesh_io_deregister_recv_cb(mesh.io, MESH_IO_FILTER_PROV);
+	mesh_io_deregister_recv_cb(mesh.io, prov_filter, sizeof(prov_filter));
 }
 
-bool mesh_init(const char *config_dir, enum mesh_io_type type, void *opts)
+static void io_ready_callback(void *user_data, bool result)
+{
+	struct mesh_init_request *req = user_data;
+
+	if (mesh.initialized)
+		return;
+
+	mesh.initialized = true;
+
+	if (result)
+		node_attach_io_all(mesh.io);
+
+	req->cb(req->user_data, result);
+
+	l_free(req);
+}
+
+bool mesh_beacon_enabled(void)
+{
+	return mesh.beacon_enabled;
+}
+
+bool mesh_relay_supported(void)
+{
+	return mesh.relay_support;
+}
+
+bool mesh_friendship_supported(void)
+{
+	return mesh.friend_support;
+}
+
+uint16_t mesh_get_crpl(void)
+{
+	return mesh.crpl;
+}
+
+uint8_t mesh_get_friend_queue_size(void)
+{
+	return mesh.friend_queue_sz;
+}
+
+static void parse_settings(const char *mesh_conf_fname)
+{
+	struct l_settings *settings;
+	char *str;
+	uint32_t value;
+
+	settings = l_settings_new();
+	if (!l_settings_load_from_file(settings, mesh_conf_fname))
+		goto done;
+
+	str = l_settings_get_string(settings, "General", "Beacon");
+	if (str) {
+		if (!strcasecmp(str, "true"))
+			mesh.beacon_enabled = true;
+		l_free(str);
+	}
+
+	str = l_settings_get_string(settings, "General", "Relay");
+	if (str) {
+		if (!strcasecmp(str, "false"))
+			mesh.relay_support = false;
+		l_free(str);
+	}
+
+	str = l_settings_get_string(settings, "General", "Friendship");
+	if (str) {
+		if (!strcasecmp(str, "false"))
+			mesh.friend_support = false;
+		l_free(str);
+	}
+
+	if (l_settings_get_uint(settings, "General", "CRPL", &value) &&
+							value <= 65535)
+		mesh.crpl = value;
+
+	if (l_settings_get_uint(settings, "General", "FriendQueueSize", &value)
+								&& value < 127)
+		mesh.friend_queue_sz = value;
+
+	if (l_settings_get_uint(settings, "General", "ProvTimeout", &value))
+		mesh.prov_timeout = value;
+
+done:
+	l_settings_free(settings);
+}
+
+bool mesh_init(const char *config_dir, const char *mesh_conf_fname,
+					enum mesh_io_type type, void *opts,
+					mesh_ready_func_t cb, void *user_data)
 {
 	struct mesh_io_caps caps;
+	struct mesh_init_request *req;
 
 	if (mesh.io)
 		return true;
@@ -156,18 +275,29 @@ bool mesh_init(const char *config_dir, enum mesh_io_type type, void *opts)
 
 	l_info("Loading node configuration from %s", storage_dir);
 
+	if (!mesh_conf_fname)
+		mesh_conf_fname = CONFIGDIR "/mesh-main.conf";
+
+	parse_settings(mesh_conf_fname);
+
 	if (!node_load_from_storage(storage_dir))
 		return false;
 
-	mesh.io = mesh_io_new(type, opts);
-	if (!mesh.io)
+	req = l_new(struct mesh_init_request, 1);
+	req->cb = cb;
+	req->user_data = user_data;
+
+	mesh.io = mesh_io_new(type, opts, io_ready_callback, req);
+	if (!mesh.io) {
+		l_free(req);
 		return false;
+	}
 
 	l_debug("io %p", mesh.io);
 	mesh_io_get_caps(mesh.io, &caps);
 	mesh.max_filters = caps.max_num_filters;
 
-	node_attach_io_all(mesh.io);
+	pending_queue = l_queue_new();
 
 	return true;
 }
@@ -179,6 +309,7 @@ static void pending_request_exit(void *data)
 
 	reply = dbus_error(msg, MESH_ERROR_FAILED, "Failed. Exiting");
 	l_dbus_send(dbus_get_bus(), reply);
+	l_dbus_message_unref(msg);
 }
 
 static void free_pending_join_call(bool failed)
@@ -190,11 +321,10 @@ static void free_pending_join_call(bool failed)
 		l_dbus_remove_watch(dbus_get_bus(),
 						join_pending->disc_watch);
 
-	mesh_agent_remove(join_pending->agent);
-
 	if (failed)
 		node_remove(join_pending->node);
 
+	l_free(join_pending->sender);
 	l_free(join_pending);
 	join_pending = NULL;
 }
@@ -211,6 +341,7 @@ void mesh_cleanup(void)
 			reply = dbus_error(join_pending->msg, MESH_ERROR_FAILED,
 							"Failed. Exiting");
 			l_dbus_send(dbus_get_bus(), reply);
+			l_dbus_message_unref(join_pending->msg);
 		}
 
 		acceptor_cancel(&mesh);
@@ -218,8 +349,11 @@ void mesh_cleanup(void)
 	}
 
 	l_queue_destroy(pending_queue, pending_request_exit);
+	mesh_agent_cleanup();
 	node_cleanup_all();
 	mesh_model_cleanup();
+	mesh_net_cleanup();
+	net_key_cleanup();
 
 	l_dbus_object_remove_interface(dbus_get_bus(), BLUEZ_MESH_PATH,
 							MESH_NETWORK_INTERFACE);
@@ -257,9 +391,6 @@ static void prov_disc_cb(struct l_dbus *bus, void *user_data)
 {
 	if (!join_pending)
 		return;
-
-	if (join_pending->msg)
-		l_dbus_message_unref(join_pending->msg);
 
 	acceptor_cancel(&mesh);
 	join_pending->disc_watch = 0;
@@ -308,6 +439,20 @@ static void send_join_failed(const char *owner, const char *path,
 	free_pending_join_call(true);
 }
 
+static void prov_join_complete_reply_cb(struct l_dbus_message *msg,
+								void *user_data)
+{
+	bool failed = false;
+
+	if (!msg || l_dbus_message_is_error(msg))
+		failed = true;
+
+	if (!failed)
+		node_finalize_new_node(join_pending->node, mesh.io);
+
+	free_pending_join_call(failed);
+}
+
 static bool prov_complete_cb(void *user_data, uint8_t status,
 					struct mesh_prov_node_info *info)
 {
@@ -323,10 +468,10 @@ static bool prov_complete_cb(void *user_data, uint8_t status,
 		return false;
 
 	owner = join_pending->sender;
-	path = join_pending->app_path;
+	path = node_get_app_path(join_pending->node);
 
 	if (status == PROV_ERR_SUCCESS &&
-	    !node_add_pending_local(join_pending->node, info))
+			!node_add_pending_local(join_pending->node, info))
 		status = PROV_ERR_UNEXPECTED_ERR;
 
 	if (status != PROV_ERR_SUCCESS) {
@@ -334,18 +479,16 @@ static bool prov_complete_cb(void *user_data, uint8_t status,
 		return false;
 	}
 
-	node_attach_io(join_pending->node, mesh.io);
 	token = node_get_token(join_pending->node);
 
+	l_debug("Calling JoinComplete (prov)");
 	msg = l_dbus_message_new_method_call(dbus, owner, path,
 						MESH_APPLICATION_INTERFACE,
 						"JoinComplete");
 
 	l_dbus_message_set_arguments(msg, "t", l_get_be64(token));
-
-	l_dbus_send(dbus, msg);
-
-	free_pending_join_call(false);
+	dbus_send_with_timeout(dbus, msg, prov_join_complete_reply_cb,
+					NULL, NULL, DEFAULT_DBUS_TIMEOUT);
 
 	return true;
 }
@@ -354,39 +497,40 @@ static void node_init_cb(struct mesh_node *node, struct mesh_agent *agent)
 {
 	struct l_dbus_message *reply;
 	uint8_t num_ele;
+	bool is_error = false;
+	struct l_dbus *dbus = dbus_get_bus();
 
 	if (!node) {
 		reply = dbus_error(join_pending->msg, MESH_ERROR_FAILED,
 				"Failed to create node from application");
-		goto fail;
+		is_error = true;
+		goto done;
 	}
 
 	join_pending->node = node;
 	num_ele = node_get_num_elements(node);
 
 	if (!acceptor_start(num_ele, join_pending->uuid, mesh.algorithms,
-				mesh.prov_timeout, agent, prov_complete_cb,
-				&mesh))
-	{
+						mesh.prov_timeout, agent,
+						prov_complete_cb, &mesh)) {
 		reply = dbus_error(join_pending->msg, MESH_ERROR_FAILED,
 				"Failed to start provisioning acceptor");
-		goto fail;
-	}
+		is_error = true;
+	} else
+		reply = l_dbus_message_new_method_return(join_pending->msg);
 
-	reply = l_dbus_message_new_method_return(join_pending->msg);
-	l_dbus_send(dbus_get_bus(), reply);
+done:
+	l_dbus_send(dbus, reply);
+	l_dbus_message_unref(join_pending->msg);
 	join_pending->msg = NULL;
 
-	/* Setup disconnect watch */
-	join_pending->disc_watch = l_dbus_add_disconnect_watch(dbus_get_bus(),
+	if (is_error)
+		free_pending_join_call(true);
+	else
+		/* Setup disconnect watch */
+		join_pending->disc_watch = l_dbus_add_disconnect_watch(dbus,
 						join_pending->sender,
 						prov_disc_cb, NULL, NULL);
-
-	return;
-
-fail:
-	l_dbus_send(dbus_get_bus(), reply);
-	free_pending_join_call(true);
 }
 
 static struct l_dbus_message *join_network_call(struct l_dbus *dbus,
@@ -429,7 +573,6 @@ static struct l_dbus_message *join_network_call(struct l_dbus *dbus,
 
 	join_pending->sender = l_strdup(sender);
 	join_pending->msg = l_dbus_message_ref(msg);
-	join_pending->app_path = app_path;
 
 	/* Try to create a temporary node */
 	node_join(app_path, sender, join_pending->uuid, node_init_cb);
@@ -445,25 +588,23 @@ static struct l_dbus_message *cancel_join_call(struct l_dbus *dbus,
 
 	l_debug("Cancel Join");
 
-	if (!join_pending) {
-		reply = dbus_error(msg, MESH_ERROR_DOES_NOT_EXIST,
+	if (!join_pending)
+		return dbus_error(msg, MESH_ERROR_DOES_NOT_EXIST,
 							"No join in progress");
-		goto done;
-	}
-
 	acceptor_cancel(&mesh);
 
 	/* Return error to the original Join call */
 	if (join_pending->msg) {
 		reply = dbus_error(join_pending->msg, MESH_ERROR_FAILED, NULL);
 		l_dbus_send(dbus_get_bus(), reply);
+		l_dbus_message_unref(join_pending->msg);
 	}
 
 	reply = l_dbus_message_new_method_return(msg);
 	l_dbus_message_set_arguments(reply, "");
 
 	free_pending_join_call(true);
-done:
+
 	return reply;
 }
 
@@ -472,24 +613,18 @@ static void attach_ready_cb(void *user_data, int status, struct mesh_node *node)
 	struct l_dbus_message *reply;
 	struct l_dbus_message *pending_msg;
 
-	pending_msg = l_queue_find(pending_queue, simple_match, user_data);
+	pending_msg = l_queue_remove_if(pending_queue, simple_match, user_data);
 	if (!pending_msg)
 		return;
 
-	if (status != MESH_ERROR_NONE) {
-		const char *desc = (status == MESH_ERROR_NOT_FOUND) ?
-				"Node match not found" : "Attach failed";
-		reply = dbus_error(pending_msg, status, desc);
-		goto done;
-	}
+	if (status == MESH_ERROR_NONE) {
+		reply = l_dbus_message_new_method_return(pending_msg);
+		node_build_attach_reply(node, reply);
+	} else
+		reply = dbus_error(pending_msg, status, "Attach failed");
 
-	reply = l_dbus_message_new_method_return(pending_msg);
-
-	node_build_attach_reply(node, reply);
-
-done:
 	l_dbus_send(dbus_get_bus(), reply);
-	l_queue_remove(pending_queue, pending_msg);
+	l_dbus_message_unref(pending_msg);
 }
 
 static struct l_dbus_message *attach_call(struct l_dbus *dbus,
@@ -499,7 +634,6 @@ static struct l_dbus_message *attach_call(struct l_dbus *dbus,
 	uint64_t token;
 	const char *app_path, *sender;
 	struct l_dbus_message *pending_msg;
-	int status;
 
 	l_debug("Attach");
 
@@ -509,19 +643,11 @@ static struct l_dbus_message *attach_call(struct l_dbus *dbus,
 	sender = l_dbus_message_get_sender(msg);
 
 	pending_msg = l_dbus_message_ref(msg);
-	if (!pending_queue)
-		pending_queue = l_queue_new();
-
 	l_queue_push_tail(pending_queue, pending_msg);
 
-	status = node_attach(app_path, sender, token, attach_ready_cb,
-								pending_msg);
-	if (status == MESH_ERROR_NONE)
-		return NULL;
+	node_attach(app_path, sender, token, attach_ready_cb, pending_msg);
 
-	l_queue_remove(pending_queue, pending_msg);
-
-	return dbus_error(msg, status, NULL);
+	return NULL;
 }
 
 static struct l_dbus_message *leave_call(struct l_dbus *dbus,
@@ -529,44 +655,77 @@ static struct l_dbus_message *leave_call(struct l_dbus *dbus,
 						void *user_data)
 {
 	uint64_t token;
+	struct mesh_node *node;
 
 	l_debug("Leave");
 
 	if (!l_dbus_message_get_arguments(msg, "t", &token))
 		return dbus_error(msg, MESH_ERROR_INVALID_ARGS, NULL);
 
-	node_remove(node_find_by_token(token));
+	node = node_find_by_token(token);
+	if (!node)
+		return dbus_error(msg, MESH_ERROR_NOT_FOUND, NULL);
+
+	if (node_is_busy(node))
+		return dbus_error(msg, MESH_ERROR_BUSY, NULL);
+
+	node_remove(node);
 
 	return l_dbus_message_new_method_return(msg);
+}
+
+static void create_join_complete_reply_cb(struct l_dbus_message *msg,
+								void *user_data)
+{
+	struct mesh_node *node = user_data;
+
+	if (!msg || l_dbus_message_is_error(msg)) {
+		node_remove(node);
+		return;
+	}
+
+	node_finalize_new_node(node, mesh.io);
 }
 
 static void create_node_ready_cb(void *user_data, int status,
 							struct mesh_node *node)
 {
+	struct l_dbus *dbus = dbus_get_bus();
 	struct l_dbus_message *reply;
 	struct l_dbus_message *pending_msg;
+	struct l_dbus_message *msg;
+	const char *owner;
+	const char *path;
 	const uint8_t *token;
 
-	pending_msg = l_queue_find(pending_queue, simple_match, user_data);
+	pending_msg = l_queue_remove_if(pending_queue, simple_match, user_data);
 	if (!pending_msg)
 		return;
 
 	if (status != MESH_ERROR_NONE) {
 		reply = dbus_error(pending_msg, status, NULL);
-		goto done;
+		l_dbus_send(dbus_get_bus(), reply);
+		l_dbus_message_unref(pending_msg);
+		return;
 	}
 
-	node_attach_io(node, mesh.io);
-
 	reply = l_dbus_message_new_method_return(pending_msg);
+
+	l_dbus_send(dbus, reply);
+
+	owner = l_dbus_message_get_sender(pending_msg);
+	path = node_get_app_path(node);
 	token = node_get_token(node);
 
-	l_debug();
-	l_dbus_message_set_arguments(reply, "t", l_get_be64(token));
+	l_debug("Calling JoinComplete (create)");
+	msg = l_dbus_message_new_method_call(dbus, owner, path,
+						MESH_APPLICATION_INTERFACE,
+						"JoinComplete");
 
-done:
-	l_dbus_send(dbus_get_bus(), reply);
-	l_queue_remove(pending_queue, pending_msg);
+	l_dbus_message_set_arguments(msg, "t", l_get_be64(token));
+	dbus_send_with_timeout(dbus, msg, create_join_complete_reply_cb,
+					node, NULL, DEFAULT_DBUS_TIMEOUT);
+	l_dbus_message_unref(pending_msg);
 }
 
 static struct l_dbus_message *create_network_call(struct l_dbus *dbus,
@@ -591,10 +750,8 @@ static struct l_dbus_message *create_network_call(struct l_dbus *dbus,
 							"Bad device UUID");
 
 	sender = l_dbus_message_get_sender(msg);
-	pending_msg = l_dbus_message_ref(msg);
-	if (!pending_queue)
-		pending_queue = l_queue_new();
 
+	pending_msg = l_dbus_message_ref(msg);
 	l_queue_push_tail(pending_queue, pending_msg);
 
 	node_create(app_path, sender, uuid, create_node_ready_cb,
@@ -659,19 +816,13 @@ static struct l_dbus_message *import_call(struct l_dbus *dbus,
 							"Bad net index");
 
 	while (l_dbus_message_iter_next_entry(&iter_flags, &key, &var)) {
-		if (!strcmp(key, "IVUpdate")) {
-			if (!l_dbus_message_iter_get_variant(&var, "b",
-								&ivu))
-				goto fail;
+		if (!strcmp(key, "IVUpdate") &&
+			l_dbus_message_iter_get_variant(&var, "b", &ivu))
 			continue;
-		}
 
-		if (!strcmp(key, "KeyRefresh")) {
-			if (!l_dbus_message_iter_get_variant(&var, "b",
-								&kr))
-				goto fail;
+		if (!strcmp(key, "KeyRefresh") &&
+			l_dbus_message_iter_get_variant(&var, "b", &kr))
 			continue;
-		}
 
 		return dbus_error(msg, MESH_ERROR_INVALID_ARGS,
 							"Bad flags");
@@ -682,27 +833,14 @@ static struct l_dbus_message *import_call(struct l_dbus *dbus,
 							"Bad address");
 
 	sender = l_dbus_message_get_sender(msg);
+
 	pending_msg = l_dbus_message_ref(msg);
-
-	if (!pending_queue)
-		pending_queue = l_queue_new();
-
 	l_queue_push_tail(pending_queue, pending_msg);
 
-	if (!node_import(app_path, sender, uuid, dev_key, net_key, net_idx,
-					kr, ivu, iv_index, unicast,
-					create_node_ready_cb, pending_msg))
-		goto fail;
+	node_import(app_path, sender, uuid, dev_key, net_key, net_idx, kr, ivu,
+			iv_index, unicast, create_node_ready_cb, pending_msg);
 
 	return NULL;
-
-fail:
-	if (pending_msg) {
-		l_dbus_message_unref(msg);
-		l_queue_remove(pending_queue, pending_msg);
-	}
-
-	return dbus_error(msg, MESH_ERROR_INVALID_ARGS, "Node import failed");
 }
 
 static void setup_network_interface(struct l_dbus_interface *iface)
@@ -720,11 +858,11 @@ static void setup_network_interface(struct l_dbus_interface *iface)
 								"token");
 
 	l_dbus_interface_method(iface, "CreateNetwork", 0, create_network_call,
-					"t", "oay", "token", "app", "uuid");
+					"", "oay", "app", "uuid");
 
 	l_dbus_interface_method(iface, "Import", 0,
 					import_call,
-					"t", "oayayayqa{sv}uq", "token",
+					"", "oayayayqa{sv}uq",
 					"app", "uuid", "dev_key", "net_key",
 					"net_index", "flags", "iv_index",
 					"unicast");

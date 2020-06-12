@@ -114,7 +114,7 @@ typedef bool (*mesh_config_node_func_t)(struct mesh_config_node *node,
 bool mesh_config_load_nodes(const char *cfgdir_name, mesh_config_node_func_t cb,
 							void *user_data);
 void mesh_config_release(struct mesh_config *cfg);
-void mesh_config_destroy(struct mesh_config *cfg);
+void mesh_config_destroy_nvm(struct mesh_config *cfg);
 bool mesh_config_save(struct mesh_config *cfg, bool no_wait,
 				mesh_config_status_func_t cb, void *user_data);
 struct mesh_config *mesh_config_create(const char *cfgdir_name,
@@ -172,3 +172,7 @@ bool mesh_config_net_key_set_phase(struct mesh_config *cfg, uint16_t idx,
 bool mesh_config_write_address(struct mesh_config *cfg, uint16_t address);
 bool mesh_config_write_iv_index(struct mesh_config *cfg, uint32_t idx,
 								bool update);
+bool mesh_config_update_company_id(struct mesh_config *cfg, uint16_t cid);
+bool mesh_config_update_product_id(struct mesh_config *cfg, uint16_t pid);
+bool mesh_config_update_version_id(struct mesh_config *cfg, uint16_t vid);
+bool mesh_config_update_crpl(struct mesh_config *cfg, uint16_t crpl);

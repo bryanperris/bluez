@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -992,6 +993,15 @@ static void report_map_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
 			BT_IO_OPT_SOURCE, ev.u.create.phys,
 			BT_IO_OPT_DEST, ev.u.create.uniq,
 			BT_IO_OPT_INVALID);
+
+	/* Phys + uniq are the same size (hw address type) */
+	for (i = 0;
+	    i < (int)sizeof(ev.u.create.phys) && ev.u.create.phys[i] != 0;
+	    ++i) {
+		ev.u.create.phys[i] = tolower(ev.u.create.phys[i]);
+		ev.u.create.uniq[i] = tolower(ev.u.create.uniq[i]);
+	}
+
 	if (gerr) {
 		error("Failed to connection details: %s", gerr->message);
 		g_error_free(gerr);
@@ -1347,7 +1357,7 @@ static struct bt_hog *hog_new(int fd, const char *name, uint16_t vendor,
 	return hog;
 }
 
-static void hog_attach_instace(struct bt_hog *hog,
+static void hog_attach_instance(struct bt_hog *hog,
 				struct gatt_db_attribute *attr)
 {
 	struct bt_hog *instance;
@@ -1363,24 +1373,33 @@ static void hog_attach_instace(struct bt_hog *hog,
 	if (!instance)
 		return;
 
-	hog->instances = g_slist_append(hog->instances, instance);
+	hog->instances = g_slist_append(hog->instances, bt_hog_ref(instance));
 }
 
 static void foreach_hog_service(struct gatt_db_attribute *attr, void *user_data)
 {
 	struct bt_hog *hog = user_data;
 
-	hog_attach_instace(hog, attr);
+	hog_attach_instance(hog, attr);
 }
 
 static void dis_notify(uint8_t source, uint16_t vendor, uint16_t product,
 					uint16_t version, void *user_data)
 {
 	struct bt_hog *hog = user_data;
+	GSList *l;
 
 	hog->vendor = vendor;
 	hog->product = product;
 	hog->version = version;
+
+	for (l = hog->instances; l; l = l->next) {
+		struct bt_hog *instance = l->data;
+
+		instance->vendor = vendor;
+		instance->product = product;
+		instance->version = version;
+	}
 }
 
 struct bt_hog *bt_hog_new(int fd, const char *name, uint16_t vendor,

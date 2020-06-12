@@ -394,7 +394,7 @@ static gboolean store_device_info_cb(gpointer user_data)
 		g_key_file_remove_key(key_file, "General", "Alias", NULL);
 
 	if (device->class) {
-		sprintf(class, "0x%6.6x", device->class);
+		sprintf(class, "0x%6.6x", device->class & 0xffffff);
 		g_key_file_set_string(key_file, "General", "Class", class);
 	} else {
 		g_key_file_remove_key(key_file, "General", "Class", NULL);
@@ -1626,15 +1626,19 @@ done:
 	if (!dev->connect)
 		return;
 
-	if (!err && dbus_message_is_method_call(dev->connect, DEVICE_INTERFACE,
-								"Connect"))
-		dev->general_connect = TRUE;
+	if (dbus_message_is_method_call(dev->connect, DEVICE_INTERFACE,
+							"Connect")) {
+		if (!err)
+			dev->general_connect = TRUE;
+		else if (find_service_with_state(dev->services,
+						BTD_SERVICE_STATE_CONNECTED))
+			/* Reset error if there are services connected */
+			err = 0;
+	}
 
 	DBG("returning response to %s", dbus_message_get_sender(dev->connect));
 
-	l = find_service_with_state(dev->services, BTD_SERVICE_STATE_CONNECTED);
-
-	if (err && l == NULL) {
+	if (err) {
 		/* Fallback to LE bearer if supported */
 		if (err == -EHOSTDOWN && dev->le && !dev->le_state.connected) {
 			err = device_connect_le(dev);
@@ -1857,7 +1861,9 @@ static DBusMessage *connect_profiles(struct btd_device *dev, uint8_t bdaddr_type
 	dev->pending = create_pending_list(dev, uuid);
 	if (!dev->pending) {
 		if (dev->svc_refreshed) {
-			if (find_service_with_state(dev->services,
+			if (dbus_message_is_method_call(msg, DEVICE_INTERFACE,
+							"Connect") &&
+				find_service_with_state(dev->services,
 						BTD_SERVICE_STATE_CONNECTED))
 				return dbus_message_new_method_return(msg);
 			else
@@ -2050,6 +2056,9 @@ static DBusMessage *disconnect_profile(DBusConnection *conn, DBusMessage *msg,
 	if (dev->disconnect)
 		return btd_error_in_progress(msg);
 
+	if (btd_service_get_state(service) == BTD_SERVICE_STATE_DISCONNECTED)
+		return dbus_message_new_method_return(msg);
+
 	dev->disconnect = dbus_message_ref(msg);
 
 	err = btd_service_disconnect(service);
@@ -2061,6 +2070,8 @@ static DBusMessage *disconnect_profile(DBusConnection *conn, DBusMessage *msg,
 
 	if (err == -ENOTSUP)
 		return btd_error_not_supported(msg);
+	else if (err == -EALREADY)
+		return dbus_message_new_method_return(msg);
 
 	return btd_error_failed(msg, strerror(-err));
 }
@@ -4584,27 +4595,18 @@ static void update_bredr_services(struct browse_req *req, sdp_list_t *recs)
 
 	for (seq = recs; seq; seq = seq->next) {
 		sdp_record_t *rec = (sdp_record_t *) seq->data;
-		sdp_list_t *svcclass = NULL;
 		char *profile_uuid;
 
 		if (!rec)
 			break;
 
-		if (sdp_get_service_classes(rec, &svcclass) < 0)
-			continue;
+		/* If service class attribute is missing, svclass will be all
+		 * zero and the resulting uuid string will be NULL.
+		 */
+		profile_uuid = bt_uuid2string(&rec->svclass);
 
-		/* Check for empty service classes list */
-		if (svcclass == NULL) {
-			DBG("Skipping record with no service classes");
+		if (!profile_uuid)
 			continue;
-		}
-
-		/* Extract the first element and skip the remainning */
-		profile_uuid = bt_uuid2string(svcclass->data);
-		if (!profile_uuid) {
-			sdp_list_free(svcclass, free);
-			continue;
-		}
 
 		if (bt_uuid_strcmp(profile_uuid, PNP_UUID) == 0) {
 			uint16_t source, vendor, product, version;
@@ -4638,7 +4640,6 @@ static void update_bredr_services(struct browse_req *req, sdp_list_t *recs)
 
 next:
 		free(profile_uuid);
-		sdp_list_free(svcclass, free);
 	}
 
 	if (sdp_key_file) {
@@ -4939,7 +4940,7 @@ static void gatt_client_init(struct btd_device *device)
 	}
 
 	device->client = bt_gatt_client_new(device->db, device->att,
-							device->att_mtu);
+							device->att_mtu, 0);
 	if (!device->client) {
 		DBG("Failed to initialize");
 		return;
@@ -5045,6 +5046,22 @@ bool device_attach_att(struct btd_device *dev, GIOChannel *io)
 	if (gerr) {
 		error("bt_io_get: %s", gerr->message);
 		g_error_free(gerr);
+		return false;
+	}
+
+	if (dev->att) {
+		if (main_opts.gatt_channels == bt_att_get_channels(dev->att)) {
+			DBG("EATT channel limit reached");
+			return false;
+		}
+
+		if (!bt_att_attach_fd(dev->att, g_io_channel_unix_get_fd(io))) {
+			DBG("EATT channel connected");
+			g_io_channel_set_close_on_unref(io, FALSE);
+			return true;
+		}
+
+		error("Failed to attach EATT channel");
 		return false;
 	}
 
@@ -5352,9 +5369,9 @@ static int device_browse_sdp(struct btd_device *device, DBusMessage *msg)
 
 	req->sdp_flags = get_sdp_flags(device);
 
-	err = bt_search_service(btd_adapter_get_address(adapter),
-				&device->bdaddr, &uuid, browse_cb, req, NULL,
-				req->sdp_flags);
+	err = bt_search(btd_adapter_get_address(adapter),
+			&device->bdaddr, &uuid, browse_cb, req, NULL,
+			req->sdp_flags);
 	if (err < 0) {
 		browse_request_free(req);
 		return err;
@@ -6141,20 +6158,52 @@ int device_confirm_passkey(struct btd_device *device, uint8_t type,
 	struct authentication_req *auth;
 	int err;
 
+	/* Just-Works repairing policy */
+	if (confirm_hint && device_is_paired(device, type)) {
+		if (main_opts.jw_repairing == JW_REPAIRING_NEVER) {
+			btd_adapter_confirm_reply(device->adapter,
+						  &device->bdaddr,
+						  type, FALSE);
+			return 0;
+		} else if (main_opts.jw_repairing == JW_REPAIRING_ALWAYS) {
+			btd_adapter_confirm_reply(device->adapter,
+						  &device->bdaddr,
+						  type, TRUE);
+			return 0;
+		}
+	}
+
 	auth = new_auth(device, type, AUTH_TYPE_CONFIRM, FALSE);
 	if (!auth)
 		return -EPERM;
 
 	auth->passkey = passkey;
 
-	if (confirm_hint)
+	if (confirm_hint) {
+		if (device->bonding != NULL) {
+			/* We know the client has indicated the intent to pair
+			 * with the peer device, so we can auto-accept.
+			 */
+			btd_adapter_confirm_reply(device->adapter,
+						  &device->bdaddr,
+						  type, TRUE);
+			return 0;
+		}
+
 		err = agent_request_authorization(auth->agent, device,
 						confirm_cb, auth, NULL);
-	else
+	} else {
 		err = agent_request_confirmation(auth->agent, device, passkey,
 						confirm_cb, auth, NULL);
+	}
 
 	if (err < 0) {
+		if (err == -EINPROGRESS) {
+			/* Already in progress */
+			confirm_cb(auth->agent, NULL, auth);
+			return 0;
+		}
+
 		error("Failed requesting authentication");
 		device_auth_req_free(device);
 	}
@@ -6202,6 +6251,12 @@ int device_notify_pincode(struct btd_device *device, gboolean secure,
 	err = agent_display_pincode(auth->agent, device, pincode,
 					display_pincode_cb, auth, NULL);
 	if (err < 0) {
+		if (err == -EINPROGRESS) {
+			/* Already in progress */
+			display_pincode_cb(auth->agent, NULL, auth);
+			return 0;
+		}
+
 		error("Failed requesting authentication");
 		device_auth_req_free(device);
 	}

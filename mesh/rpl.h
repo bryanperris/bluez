@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2018-2019  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2020  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -17,20 +17,14 @@
  *
  */
 
-/*
- * Important: Changes in this table must be reflected in the
- * the entries of error_table[] in dbus.c
- */
-enum mesh_error {
-	MESH_ERROR_NONE,
-	MESH_ERROR_FAILED,
-	MESH_ERROR_NOT_AUTHORIZED,
-	MESH_ERROR_NOT_FOUND,
-	MESH_ERROR_INVALID_ARGS,
-	MESH_ERROR_IN_PROGRESS,
-	MESH_ERROR_BUSY,
-	MESH_ERROR_ALREADY_EXISTS,
-	MESH_ERROR_DOES_NOT_EXIST,
-	MESH_ERROR_CANCELED,
-	MESH_ERROR_NOT_IMPLEMENTED,
+struct mesh_rpl {
+	uint32_t iv_index;
+	uint32_t seq;
+	uint16_t src;
 };
+
+bool rpl_put_entry(struct mesh_node *node, uint16_t src, uint32_t iv_index,
+								uint32_t seq);
+void rpl_del_entry(struct mesh_node *node, uint16_t src);
+bool rpl_get_list(struct mesh_node *node, struct l_queue *rpl_list);
+void rpl_init(struct mesh_node *node, uint32_t iv_index);

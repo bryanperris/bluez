@@ -2,7 +2,7 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2019  Intel Corporation. All rights reserved.
+ *  Copyright (C) 2019-2020  Intel Corporation. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -35,15 +35,46 @@ struct remote_node {
 	uint16_t unicast;
 	struct l_queue *net_keys;
 	struct l_queue *app_keys;
+	struct l_queue **els;
 	uint8_t uuid[16];
 	uint8_t num_ele;
 };
 
 static struct l_queue *nodes;
 
-static bool simple_match(const void *a, const void *b)
+
+static bool key_present(struct l_queue *keys, uint16_t app_idx)
 {
-	return a == b;
+	const struct l_queue_entry *l;
+
+	for (l = l_queue_get_entries(keys); l; l = l->next) {
+		uint16_t idx = L_PTR_TO_UINT(l->data);
+
+		if (idx == app_idx)
+			return true;
+	}
+
+	return false;
+}
+
+static int compare_mod_id(const void *a, const void *b, void *user_data)
+{
+	uint32_t id1 = L_PTR_TO_UINT(a);
+	uint32_t id2 = L_PTR_TO_UINT(b);
+
+	if (id1 >= VENDOR_ID_MASK)
+		id1 &= ~VENDOR_ID_MASK;
+
+	if (id2 >= VENDOR_ID_MASK)
+		id2 &= ~VENDOR_ID_MASK;
+
+	if (id1 < id2)
+		return -1;
+
+	if (id1 > id2)
+		return 1;
+
+	return 0;
 }
 
 static int compare_unicast(const void *a, const void *b, void *user_data)
@@ -72,6 +103,39 @@ static bool match_node_addr(const void *a, const void *b)
 	return false;
 }
 
+static bool match_bound_key(const void *a, const void *b)
+{
+	uint16_t app_idx = L_PTR_TO_UINT(a);
+	uint16_t net_idx = L_PTR_TO_UINT(b);
+
+	return (net_idx == keys_get_bound_key(app_idx));
+}
+
+uint8_t remote_del_node(uint16_t unicast)
+{
+	struct remote_node *rmt;
+	uint8_t num_ele, i;
+
+	rmt = l_queue_remove_if(nodes, match_node_addr, L_UINT_TO_PTR(unicast));
+	if (!rmt)
+		return 0;
+
+	num_ele = rmt->num_ele;
+
+	for (i = 0; i < num_ele; ++i)
+		l_queue_destroy(rmt->els[i], NULL);
+
+	l_free(rmt->els);
+
+	l_queue_destroy(rmt->net_keys, l_free);
+	l_queue_destroy(rmt->app_keys, l_free);
+	l_free(rmt);
+
+	mesh_db_del_node(unicast);
+
+	return num_ele;
+}
+
 bool remote_add_node(const uint8_t uuid[16], uint16_t unicast,
 					uint8_t ele_cnt, uint16_t net_idx)
 {
@@ -89,10 +153,36 @@ bool remote_add_node(const uint8_t uuid[16], uint16_t unicast,
 
 	l_queue_push_tail(rmt->net_keys, L_UINT_TO_PTR(net_idx));
 
+	rmt->els = l_new(struct l_queue *, ele_cnt);
+
 	if (!nodes)
 		nodes = l_queue_new();
 
 	l_queue_insert(nodes, rmt, compare_unicast, NULL);
+	return true;
+}
+
+bool remote_set_model(uint16_t unicast, uint8_t ele_idx, uint32_t mod_id,
+								bool vendor)
+{
+	struct remote_node *rmt;
+
+	rmt = l_queue_find(nodes, match_node_addr, L_UINT_TO_PTR(unicast));
+	if (!rmt)
+		return false;
+
+	if (ele_idx >= rmt->num_ele)
+		return false;
+
+	if (!rmt->els[ele_idx])
+		rmt->els[ele_idx] = l_queue_new();
+
+	if (!vendor)
+		mod_id = VENDOR_ID_MASK | mod_id;
+
+	l_queue_insert(rmt->els[ele_idx], L_UINT_TO_PTR(mod_id),
+							compare_mod_id, NULL);
+
 	return true;
 }
 
@@ -104,7 +194,7 @@ bool remote_add_net_key(uint16_t addr, uint16_t net_idx)
 	if (!rmt)
 		return false;
 
-	if (l_queue_find(rmt->net_keys, simple_match, L_UINT_TO_PTR(net_idx)))
+	if (key_present(rmt->net_keys, net_idx))
 		return false;
 
 	l_queue_push_tail(rmt->net_keys, L_UINT_TO_PTR(net_idx));
@@ -114,7 +204,7 @@ bool remote_add_net_key(uint16_t addr, uint16_t net_idx)
 bool remote_del_net_key(uint16_t addr, uint16_t net_idx)
 {
 	struct remote_node *rmt;
-	const struct l_queue_entry *l;
+	void *data;
 
 	rmt = l_queue_find(nodes, match_node_addr, L_UINT_TO_PTR(addr));
 	if (!rmt)
@@ -123,13 +213,14 @@ bool remote_del_net_key(uint16_t addr, uint16_t net_idx)
 	if (!l_queue_remove(rmt->net_keys, L_UINT_TO_PTR(net_idx)))
 		return false;
 
-	for (l = l_queue_get_entries(rmt->app_keys); l; l = l->next) {
-		uint16_t app_idx = (uint16_t) L_PTR_TO_UINT(l->data);
+	data = l_queue_remove_if(rmt->app_keys, match_bound_key,
+						L_UINT_TO_PTR(net_idx));
+	while (data) {
+		uint16_t app_idx = (uint16_t) L_PTR_TO_UINT(data);
 
-		if (net_idx == keys_get_bound_key(app_idx)) {
-			l_queue_remove(rmt->app_keys, L_UINT_TO_PTR(app_idx));
-			mesh_db_node_app_key_del(rmt->unicast, app_idx);
-		}
+		mesh_db_node_app_key_del(rmt->unicast, app_idx);
+		data = l_queue_remove_if(rmt->app_keys, match_bound_key,
+						L_UINT_TO_PTR(net_idx));
 	}
 
 	return true;
@@ -146,7 +237,7 @@ bool remote_add_app_key(uint16_t addr, uint16_t app_idx)
 	if (!rmt->app_keys)
 		rmt->app_keys = l_queue_new();
 
-	if (l_queue_find(rmt->app_keys, simple_match, L_UINT_TO_PTR(app_idx)))
+	if (key_present(rmt->app_keys, app_idx))
 		return false;
 
 	l_queue_push_tail(rmt->app_keys, L_UINT_TO_PTR(app_idx));
@@ -179,16 +270,42 @@ uint16_t remote_get_subnet_idx(uint16_t addr)
 	return (uint16_t) net_idx;
 }
 
-static void print_key(void *net_key, void *user_data)
+static void print_key(void *key, void *user_data)
 {
-	uint16_t net_idx = L_PTR_TO_UINT(net_key);
+	uint16_t idx = L_PTR_TO_UINT(key);
 
-	bt_shell_printf("%3.3x, ", net_idx);
+	bt_shell_printf("%u (0x%3.3x), ", idx, idx);
+}
+
+static void print_model(void *model, void *user_data)
+{
+	uint32_t mod_id = L_PTR_TO_UINT(model);
+
+	if (mod_id >= VENDOR_ID_MASK) {
+		mod_id &= ~VENDOR_ID_MASK;
+		bt_shell_printf("\t\t\t" COLOR_GREEN "SIG model: %4.4x\n"
+							COLOR_OFF, mod_id);
+		return;
+	}
+
+	bt_shell_printf("\t\t\t" COLOR_GREEN "Vendor model: %8.8x\n"
+							COLOR_OFF, mod_id);
+
+}
+
+static void print_element(struct l_queue *mods, int idx)
+{
+	if (!mods)
+		return;
+
+	bt_shell_printf("\t\t" COLOR_GREEN "element %u:\n" COLOR_OFF, idx);
+	l_queue_foreach(mods, print_model, NULL);
 }
 
 static void print_node(void *rmt, void *user_data)
 {
 	struct remote_node *node = rmt;
+	int i;
 	char *str;
 
 	bt_shell_printf(COLOR_YELLOW "Mesh node:\n" COLOR_OFF);
@@ -197,8 +314,6 @@ static void print_node(void *rmt, void *user_data)
 	l_free(str);
 	bt_shell_printf("\t" COLOR_GREEN "primary = %4.4x\n" COLOR_OFF,
 								node->unicast);
-	bt_shell_printf("\t" COLOR_GREEN "elements = %u\n" COLOR_OFF,
-								node->num_ele);
 	bt_shell_printf("\t" COLOR_GREEN "net_keys = ");
 	l_queue_foreach(node->net_keys, print_key, NULL);
 	bt_shell_printf("\n" COLOR_OFF);
@@ -208,6 +323,12 @@ static void print_node(void *rmt, void *user_data)
 		l_queue_foreach(node->app_keys, print_key, NULL);
 		bt_shell_printf("\n" COLOR_OFF);
 	}
+
+	bt_shell_printf("\t" COLOR_GREEN "elements (%u):\n" COLOR_OFF,
+								node->num_ele);
+
+	for (i = 0; i < node->num_ele; ++i)
+		print_element(node->els[i], i);
 }
 
 void remote_print_node(uint16_t addr)

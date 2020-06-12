@@ -48,19 +48,12 @@
 #include "profile.h"
 #include "service.h"
 
-#ifndef ATT_CID
-#define ATT_CID 4
-#endif
-
-#ifndef ATT_PSM
-#define ATT_PSM 31
-#endif
-
 #define GATT_MANAGER_IFACE	"org.bluez.GattManager1"
 #define GATT_PROFILE_IFACE	"org.bluez.GattProfile1"
 #define GATT_SERVICE_IFACE	"org.bluez.GattService1"
 #define GATT_CHRC_IFACE		"org.bluez.GattCharacteristic1"
 #define GATT_DESC_IFACE		"org.bluez.GattDescriptor1"
+#define ERROR_FAILED		ERROR_INTERFACE ".Failed"
 
 #define UUID_GAP	0x1800
 #define UUID_GATT	0x1801
@@ -80,7 +73,8 @@ struct btd_gatt_database {
 	struct gatt_db *db;
 	unsigned int db_id;
 	GIOChannel *le_io;
-	GIOChannel *l2cap_io;
+	GIOChannel *eatt_io;
+	GIOChannel *bredr_io;
 	struct queue *records;
 	struct queue *device_states;
 	struct queue *ccc_callbacks;
@@ -88,6 +82,7 @@ struct btd_gatt_database {
 	struct gatt_db_attribute *svc_chngd_ccc;
 	struct gatt_db_attribute *cli_feat;
 	struct gatt_db_attribute *db_hash;
+	struct gatt_db_attribute *eatt;
 	struct queue *apps;
 	struct queue *profiles;
 };
@@ -594,9 +589,14 @@ static void gatt_database_free(void *data)
 		g_io_channel_unref(database->le_io);
 	}
 
-	if (database->l2cap_io) {
-		g_io_channel_shutdown(database->l2cap_io, FALSE, NULL);
-		g_io_channel_unref(database->l2cap_io);
+	if (database->eatt_io) {
+		g_io_channel_shutdown(database->eatt_io, FALSE, NULL);
+		g_io_channel_unref(database->eatt_io);
+	}
+
+	if (database->bredr_io) {
+		g_io_channel_shutdown(database->bredr_io, FALSE, NULL);
+		g_io_channel_unref(database->bredr_io);
 	}
 
 	/* TODO: Persistently store CCC states before freeing them */
@@ -717,7 +717,7 @@ static sdp_record_t *record_new(uuid_t *uuid, uint16_t start, uint16_t end)
 	uuid_t root_uuid, proto_uuid, l2cap;
 	sdp_record_t *record;
 	sdp_data_t *psm, *sh, *eh;
-	uint16_t lp = ATT_PSM;
+	uint16_t lp = BT_ATT_PSM;
 
 	if (uuid == NULL)
 		return NULL;
@@ -1012,7 +1012,7 @@ static void gatt_ccc_write_cb(struct gatt_db_attribute *attrib,
 	if (ccc_cb->callback) {
 		struct pending_op *op;
 
-		op = pending_ccc_new(att, attrib, get_le16(value),
+		op = pending_ccc_new(att, attrib, val,
 					bt_att_get_link_type(att));
 		if (!op) {
 			ecode = BT_ATT_ERROR_UNLIKELY;
@@ -1098,7 +1098,11 @@ static void cli_feat_write_cb(struct gatt_db_attribute *attrib,
 {
 	struct btd_gatt_database *database = user_data;
 	struct device_state *state;
+	uint8_t bits[] = { BT_GATT_CHRC_CLI_FEAT_ROBUST_CACHING,
+				BT_GATT_CHRC_CLI_FEAT_EATT,
+				BT_GATT_CHRC_CLI_FEAT_NFY_MULTI };
 	uint8_t ecode = 0;
+	unsigned int i;
 
 	DBG("Client Features write");
 
@@ -1113,13 +1117,12 @@ static void cli_feat_write_cb(struct gatt_db_attribute *attrib,
 		goto done;
 	}
 
-	/* A client shall never clear a bit it has set.
-	 * TODO: make it generic to any bits.
-	 */
-	if (state->cli_feat[0] & BT_GATT_CHRC_CLI_FEAT_ROBUST_CACHING &&
-			!(value[0] & BT_GATT_CHRC_CLI_FEAT_ROBUST_CACHING)) {
-		ecode = BT_ATT_ERROR_VALUE_NOT_ALLOWED;
-		goto done;
+	for (i = 0; i < sizeof(bits); i++) {
+		/* A client shall never clear a bit it has set */
+		if (state->cli_feat[0] & (1 << i) && !(value[0] & (1 << i))) {
+			ecode = BT_ATT_ERROR_VALUE_NOT_ALLOWED;
+			goto done;
+		}
 	}
 
 	/* Shall we reallocate the feat array if bigger? */
@@ -1129,7 +1132,7 @@ static void cli_feat_write_cb(struct gatt_db_attribute *attrib,
 		len--;
 	}
 
-	state->cli_feat[0] &= BT_GATT_CHRC_CLI_FEAT_ROBUST_CACHING;
+	state->cli_feat[0] &= ((1 << sizeof(bits)) - 1);
 	state->change_aware = true;
 
 done:
@@ -1161,6 +1164,28 @@ static void db_hash_read_cb(struct gatt_db_attribute *attrib,
 		state->change_aware = true;
 }
 
+static void server_feat_read_cb(struct gatt_db_attribute *attrib,
+					unsigned int id, uint16_t offset,
+					uint8_t opcode, struct bt_att *att,
+					void *user_data)
+{
+	struct btd_gatt_database *database = user_data;
+	struct device_state *state;
+	uint8_t ecode = 0;
+	uint8_t value = 0;
+
+	state = get_device_state(database, att);
+	if (!state) {
+		ecode = BT_ATT_ERROR_UNLIKELY;
+		goto done;
+	}
+
+	value |= BT_GATT_CHRC_SERVER_FEAT_EATT;
+
+done:
+	gatt_db_attribute_read_result(attrib, id, ecode, &value, sizeof(value));
+}
+
 static void populate_gatt_service(struct btd_gatt_database *database)
 {
 	bt_uuid_t uuid;
@@ -1168,11 +1193,11 @@ static void populate_gatt_service(struct btd_gatt_database *database)
 
 	/* Add the GATT service */
 	bt_uuid16_create(&uuid, UUID_GATT);
-	service = gatt_db_add_service(database->db, &uuid, true, 8);
+	service = gatt_db_add_service(database->db, &uuid, true, 10);
 
 	bt_uuid16_create(&uuid, GATT_CHARAC_SERVICE_CHANGED);
 	database->svc_chngd = gatt_db_service_add_characteristic(service, &uuid,
-				BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_INDICATE,
+				BT_ATT_PERM_NONE, BT_GATT_CHRC_PROP_INDICATE,
 				NULL, NULL, database);
 
 	database->svc_chngd_ccc = service_add_ccc(service, database, NULL, NULL,
@@ -1186,10 +1211,22 @@ static void populate_gatt_service(struct btd_gatt_database *database)
 				cli_feat_read_cb, cli_feat_write_cb,
 				database);
 
-	bt_uuid16_create(&uuid, GATT_CHARAC_DB_HASH);
-	database->db_hash = gatt_db_service_add_characteristic(service,
+
+	/* Only expose database hash chrc if supported */
+	if (gatt_db_hash_support(database->db)) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_DB_HASH);
+		database->db_hash = gatt_db_service_add_characteristic(service,
 				&uuid, BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_READ,
 				db_hash_read_cb, NULL, database);
+	}
+
+	/* Only enable EATT if there is a socket listening */
+	if (database->eatt_io) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_SERVER_FEAT);
+		database->eatt = gatt_db_service_add_characteristic(service,
+				&uuid, BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_READ,
+				server_feat_read_cb, NULL, database);
+	}
 
 	gatt_db_service_set_active(service, true);
 
@@ -1302,7 +1339,8 @@ static void send_notification_to_device(void *data, void *user_data)
 		DBG("GATT server sending notification");
 		bt_gatt_server_send_notification(server,
 					notify->handle, notify->value,
-					notify->len);
+					notify->len, device_state->cli_feat[0] &
+					BT_GATT_CHRC_CLI_FEAT_NFY_MULTI);
 		return;
 	}
 
@@ -1994,28 +2032,30 @@ static bool parse_handle(GDBusProxy *proxy, uint16_t *handle)
 	return true;
 }
 
-static uint8_t dbus_error_to_att_ecode(const char *error_name)
+static uint8_t dbus_error_to_att_ecode(const char *error_name, uint8_t perm_err)
 {
-
-	if (strcmp(error_name, "org.bluez.Error.Failed") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".Failed") == 0)
 		return 0x80;  /* For now return this "application error" */
 
-	if (strcmp(error_name, "org.bluez.Error.NotSupported") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".NotSupported") == 0)
 		return BT_ATT_ERROR_REQUEST_NOT_SUPPORTED;
 
-	if (strcmp(error_name, "org.bluez.Error.NotAuthorized") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".NotAuthorized") == 0)
 		return BT_ATT_ERROR_AUTHORIZATION;
 
-	if (strcmp(error_name, "org.bluez.Error.InvalidValueLength") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".InvalidValueLength") == 0)
 		return BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN;
 
-	if (strcmp(error_name, "org.bluez.Error.InvalidOffset") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".InvalidOffset") == 0)
 		return BT_ATT_ERROR_INVALID_OFFSET;
 
-	if (strcmp(error_name, "org.bluez.Error.InProgress") == 0)
+	if (strcmp(error_name, ERROR_INTERFACE ".InProgress") == 0)
 		return BT_ERROR_ALREADY_IN_PROGRESS;
 
-	return 0;
+	if (strcmp(error_name, ERROR_INTERFACE ".NotPermitted") == 0)
+		return perm_err;
+
+	return BT_ATT_ERROR_UNLIKELY;
 }
 
 static void read_reply_cb(DBusMessage *message, void *user_data)
@@ -2036,8 +2076,8 @@ static void read_reply_cb(DBusMessage *message, void *user_data)
 
 	if (dbus_set_error_from_message(&err, message) == TRUE) {
 		DBG("Failed to read value: %s: %s", err.name, err.message);
-		ecode = dbus_error_to_att_ecode(err.name);
-		ecode = ecode ? ecode : BT_ATT_ERROR_READ_NOT_PERMITTED;
+		ecode = dbus_error_to_att_ecode(err.name,
+					BT_ATT_ERROR_READ_NOT_PERMITTED);
 		dbus_error_free(&err);
 		goto done;
 	}
@@ -2102,10 +2142,10 @@ static void append_options(DBusMessageIter *iter, void *user_data)
 	uint16_t mtu;
 
 	switch (op->link_type) {
-	case BT_ATT_LINK_BREDR:
+	case BT_ATT_BREDR:
 		link = "BR/EDR";
 		break;
-	case BT_ATT_LINK_LE:
+	case BT_ATT_LE:
 		link = "LE";
 		break;
 	default:
@@ -2213,8 +2253,8 @@ static void write_reply_cb(DBusMessage *message, void *user_data)
 
 	if (dbus_set_error_from_message(&err, message) == TRUE) {
 		DBG("Failed to write value: %s: %s", err.name, err.message);
-		ecode = dbus_error_to_att_ecode(err.name);
-		ecode = ecode ? ecode : BT_ATT_ERROR_WRITE_NOT_PERMITTED;
+		ecode = dbus_error_to_att_ecode(err.name,
+					BT_ATT_ERROR_WRITE_NOT_PERMITTED);
 		dbus_error_free(&err);
 		goto done;
 	}
@@ -2322,7 +2362,7 @@ static bool sock_io_read(struct io *io, void *user_data)
 	ssize_t bytes_read;
 
 	bytes_read = read(fd, buf, sizeof(buf));
-	if (bytes_read < 0)
+	if (bytes_read <= 0)
 		return false;
 
 	send_notification_to_devices(chrc->service->app->database,
@@ -2343,8 +2383,6 @@ static struct io *sock_io_new(int fd, void *user_data)
 
 	io_set_close_on_destroy(io, true);
 
-	io_set_read_handler(io, sock_io_read, user_data, NULL);
-
 	io_set_disconnect_handler(io, sock_hup, user_data, NULL);
 
 	return io;
@@ -2360,6 +2398,7 @@ static int sock_io_send(struct io *io, const void *data, size_t len)
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
 
 	return sendmsg(io_get_fd(io), &msg, MSG_NOSIGNAL);
 }
@@ -2372,12 +2411,29 @@ static void acquire_write_reply(DBusMessage *message, void *user_data)
 	int fd;
 	uint16_t mtu;
 
+	if (!op->owner_queue) {
+		DBG("Pending write was canceled when object got removed");
+		return;
+	}
+
 	chrc = gatt_db_attribute_get_user_data(op->attrib);
 	dbus_error_init(&err);
 
 	if (dbus_set_error_from_message(&err, message) == TRUE) {
+		uint8_t ecode;
+
 		error("Failed to acquire write: %s\n", err.name);
+
+		ecode = dbus_error_to_att_ecode(err.name,
+					BT_ATT_ERROR_WRITE_NOT_PERMITTED);
 		dbus_error_free(&err);
+
+		if (ecode != BT_ATT_ERROR_UNLIKELY) {
+			gatt_db_attribute_write_result(op->attrib, op->id,
+								ecode);
+			return;
+		}
+
 		goto retry;
 	}
 
@@ -2432,8 +2488,8 @@ static struct pending_op *acquire_write(struct external_chrc *chrc,
 {
 	struct pending_op *op;
 
-	op = pending_write_new(device, NULL, attrib, id, value, len, 0,
-						link_type, false, false);
+	op = pending_write_new(device, chrc->pending_writes, attrib, id, value,
+				len, 0, link_type, false, false);
 
 	if (g_dbus_proxy_method_call(chrc->proxy, "AcquireWrite",
 					acquire_write_setup,
@@ -2454,10 +2510,22 @@ static void acquire_notify_reply(DBusMessage *message, void *user_data)
 	int fd;
 	uint16_t mtu;
 
+	if (!op->owner_queue) {
+		DBG("Pending notify was canceled when object got removed");
+		return;
+	}
+
 	dbus_error_init(&err);
 
 	if (dbus_set_error_from_message(&err, message) == TRUE) {
 		error("Failed to acquire notify: %s\n", err.name);
+
+		if (dbus_error_has_name(&err, DBUS_ERROR_NO_REPLY) ||
+				dbus_error_has_name(&err, ERROR_FAILED)) {
+			dbus_error_free(&err);
+			return;
+		}
+
 		dbus_error_free(&err);
 		goto retry;
 	}
@@ -2472,6 +2540,7 @@ static void acquire_notify_reply(DBusMessage *message, void *user_data)
 	DBG("AcquireNotify success: fd %d MTU %u\n", fd, mtu);
 
 	chrc->notify_io = sock_io_new(fd, chrc);
+	io_set_read_handler(chrc->notify_io, sock_io_read, chrc, NULL);
 
 	__sync_fetch_and_add(&chrc->ntfy_cnt, 1);
 
@@ -2553,6 +2622,7 @@ static uint8_t ccc_write_cb(struct pending_op *op, void *user_data)
 	if (g_dbus_proxy_get_property(chrc->proxy, "NotifyAcquired", &iter)) {
 		op->data.iov_base = (void *) chrc;
 		op->data.iov_len = sizeof(chrc);
+		op->owner_queue = chrc->pending_writes;
 		if (g_dbus_proxy_method_call(chrc->proxy, "AcquireNotify",
 						acquire_notify_setup,
 						acquire_notify_reply,
@@ -3525,7 +3595,7 @@ struct btd_gatt_database *btd_gatt_database_new(struct btd_adapter *adapter)
 					BT_IO_OPT_SOURCE_BDADDR, addr,
 					BT_IO_OPT_SOURCE_TYPE,
 					btd_adapter_get_address_type(adapter),
-					BT_IO_OPT_CID, ATT_CID,
+					BT_IO_OPT_CID, BT_ATT_CID,
 					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
 					BT_IO_OPT_INVALID);
 	if (!database->le_io) {
@@ -3534,14 +3604,34 @@ struct btd_gatt_database *btd_gatt_database_new(struct btd_adapter *adapter)
 		goto fail;
 	}
 
-	/* BR/EDR socket */
-	database->l2cap_io = bt_io_listen(connect_cb, NULL, NULL, NULL, &gerr,
+	/* If just just 1 channel is enabled EATT is not required */
+	if (main_opts.gatt_channels == 1)
+		goto bredr;
+
+	/* EATT socket */
+	database->eatt_io = bt_io_listen(connect_cb, NULL, NULL, NULL,
+					&gerr,
 					BT_IO_OPT_SOURCE_BDADDR, addr,
-					BT_IO_OPT_PSM, ATT_PSM,
+					BT_IO_OPT_SOURCE_TYPE,
+					btd_adapter_get_address_type(adapter),
+					BT_IO_OPT_PSM, BT_ATT_EATT_PSM,
+					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
+					BT_IO_OPT_MTU, main_opts.gatt_mtu,
+					BT_IO_OPT_INVALID);
+	if (!database->eatt_io) {
+		g_error_free(gerr);
+		goto fail;
+	}
+
+bredr:
+	/* BR/EDR socket */
+	database->bredr_io = bt_io_listen(connect_cb, NULL, NULL, NULL, &gerr,
+					BT_IO_OPT_SOURCE_BDADDR, addr,
+					BT_IO_OPT_PSM, BT_ATT_PSM,
 					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_MEDIUM,
 					BT_IO_OPT_MTU, main_opts.gatt_mtu,
 					BT_IO_OPT_INVALID);
-	if (database->l2cap_io == NULL) {
+	if (database->bredr_io == NULL) {
 		error("Failed to start listening: %s", gerr->message);
 		g_error_free(gerr);
 		goto fail;

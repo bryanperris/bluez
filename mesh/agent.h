@@ -42,6 +42,8 @@ void mesh_agent_init(void);
 void mesh_agent_cleanup(void);
 struct mesh_agent *mesh_agent_create(const char *path, const char *owner,
 					struct l_dbus_message_iter *properties);
+void mesh_agent_refresh(struct mesh_agent *agent, mesh_agent_cb_t cb,
+							void *user_data);
 
 void mesh_agent_remove(struct mesh_agent *agent);
 void mesh_agent_cancel(struct mesh_agent *agent);
@@ -54,8 +56,8 @@ int mesh_agent_display_number(struct mesh_agent *agent, bool initiator,
 int mesh_agent_prompt_number(struct mesh_agent *agent, bool initiator,
 				uint8_t action, mesh_agent_number_cb_t cb,
 				void *user_data);
-int mesh_agent_prompt_alpha(struct mesh_agent *agent, mesh_agent_key_cb_t cb,
-							void *user_data);
+int mesh_agent_prompt_alpha(struct mesh_agent *agent, bool initiator,
+				mesh_agent_key_cb_t cb, void *user_data);
 int mesh_agent_request_static(struct mesh_agent *agent, mesh_agent_key_cb_t cb,
 							void *user_data);
 int mesh_agent_request_private_key(struct mesh_agent *agent,

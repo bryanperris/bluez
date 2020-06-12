@@ -31,15 +31,25 @@
 #include "tools/mesh/keys.h"
 
 struct net_key {
-	uint16_t idx;
 	struct l_queue *app_keys;
+	uint16_t idx;
+	uint8_t phase;
 };
 
 static struct l_queue *net_keys;
 
-static bool simple_match(const void *a, const void *b)
+static bool app_key_present(const struct net_key *key, uint16_t app_idx)
 {
-	return a == b;
+	const struct l_queue_entry *l;
+
+	for (l = l_queue_get_entries(key->app_keys); l; l = l->next) {
+		uint16_t idx = L_PTR_TO_UINT(l->data);
+
+		if (idx == app_idx)
+			return true;
+	}
+
+	return false;
 }
 
 static bool net_idx_match(const void *a, const void *b)
@@ -69,6 +79,7 @@ void keys_add_net_key(uint16_t net_idx)
 
 	key = l_new(struct net_key, 1);
 	key->idx = net_idx;
+	key->phase = KEY_REFRESH_PHASE_NONE;
 
 	l_queue_push_tail(net_keys, key);
 }
@@ -88,6 +99,38 @@ void keys_del_net_key(uint16_t idx)
 	l_free(key);
 }
 
+void keys_set_net_key_phase(uint16_t net_idx, uint8_t phase, bool save)
+{
+	struct net_key *key;
+
+	if (!net_keys)
+		return;
+
+	key = l_queue_find(net_keys, net_idx_match, L_UINT_TO_PTR(net_idx));
+	if (!key)
+		return;
+
+	key->phase = phase;
+
+	if (save && !mesh_db_net_key_phase_set(net_idx, phase))
+		bt_shell_printf("Failed to save updated KR phase\n");
+}
+
+bool keys_get_net_key_phase(uint16_t net_idx, uint8_t *phase)
+{
+	struct net_key *key;
+
+	if (!phase || !net_keys)
+		return false;
+
+	key = l_queue_find(net_keys, net_idx_match, L_UINT_TO_PTR(net_idx));
+	if (!key)
+		return false;
+
+	*phase = key->phase;
+	return true;
+}
+
 void keys_add_app_key(uint16_t net_idx, uint16_t app_idx)
 {
 	struct net_key *key;
@@ -102,7 +145,7 @@ void keys_add_app_key(uint16_t net_idx, uint16_t app_idx)
 	if (!key->app_keys)
 		key->app_keys = l_queue_new();
 
-	if (l_queue_find(key->app_keys, simple_match, L_UINT_TO_PTR(app_idx)))
+	if (app_key_present(key, app_idx))
 		return;
 
 	l_queue_push_tail(key->app_keys, L_UINT_TO_PTR(app_idx));
@@ -121,8 +164,7 @@ void keys_del_app_key(uint16_t app_idx)
 		if (!key->app_keys)
 			continue;
 
-		if (l_queue_remove_if(key->app_keys, simple_match,
-							L_UINT_TO_PTR(app_idx)))
+		if (l_queue_remove(key->app_keys, L_UINT_TO_PTR(app_idx)))
 			return;
 	}
 }
@@ -140,8 +182,7 @@ uint16_t keys_get_bound_key(uint16_t app_idx)
 		if (!key->app_keys)
 			continue;
 
-		if (l_queue_find(key->app_keys, simple_match,
-							L_UINT_TO_PTR(app_idx)))
+		if (app_key_present(key, app_idx))
 			return key->idx;
 	}
 
@@ -152,14 +193,15 @@ static void print_appkey(void *app_key, void *user_data)
 {
 	uint16_t app_idx = L_PTR_TO_UINT(app_key);
 
-	bt_shell_printf("%3.3x, ", app_idx);
+	bt_shell_printf("%u (0x%3.3x), ", app_idx, app_idx);
 }
 
 static void print_netkey(void *net_key, void *user_data)
 {
 	struct net_key *key = net_key;
 
-	bt_shell_printf(COLOR_YELLOW "NetKey: %3.3x\n" COLOR_OFF, key->idx);
+	bt_shell_printf(COLOR_YELLOW "NetKey: %u (0x%3.3x), phase: %u\n"
+				COLOR_OFF, key->idx, key->idx, key->phase);
 
 	if (!key->app_keys || l_queue_isempty(key->app_keys))
 		return;
@@ -172,4 +214,12 @@ static void print_netkey(void *net_key, void *user_data)
 void keys_print_keys(void)
 {
 	l_queue_foreach(net_keys, print_netkey, NULL);
+}
+
+bool keys_subnet_exists(uint16_t idx)
+{
+	if (!l_queue_find(net_keys, net_idx_match, L_UINT_TO_PTR(idx)))
+		return false;
+
+	return true;
 }

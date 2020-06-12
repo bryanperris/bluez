@@ -163,6 +163,8 @@ char *hci_bustostr(int bus)
 		return "I2C";
 	case HCI_SMD:
 		return "SMD";
+	case HCI_VIRTIO:
+		return "VIRTIO";
 	default:
 		return "Unknown";
 	}
@@ -660,6 +662,7 @@ static hci_map ver_map[] = {
 	{ "4.2",	0x08 },
 	{ "5.0",	0x09 },
 	{ "5.1",	0x0a },
+	{ "5.2",	0x0b },
 	{ NULL }
 };
 
