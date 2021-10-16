@@ -117,6 +117,7 @@ ell_headers = ell/util.h \
 			ell/signal.h \
 			ell/time.h \
 			ell/time-private.h \
+            ell/cleanup.h \
 			ell/timeout.h \
 			ell/cipher.h \
 			ell/checksum.h \

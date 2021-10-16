@@ -10,7 +10,6 @@ fi
 	--mandir=/usr/share/man \
 	--sysconfdir=/etc \
 	--localstatedir=/var \
-        --with-package=ell \
 	--enable-mesh \
 	--enable-debug \
 	--enable-experimental \
